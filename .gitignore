@@ -1,0 +1,42 @@
+# Python bytecode and local caches
+__pycache__/
+*.py[cod]
+*.pyc.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Python environments
+.venv/
+venv/
+env/
+.env
+
+# Large CFD / Abaqus inputs and generated analysis outputs
+*.cgns
+*.odb
+*.lck
+*.dat
+*.msg
+*.sta
+*.sim
+*.prt
+*.npz
+*.json.gz
+*.csv
+cgns_pressure_output/
+
+# Generated mapped Abaqus files
+*_mapped.inp
+*_mapped_*Hz.inp
+*_loads.inc
+mapping_report.json
+
+# Build and packaging artifacts
+.pyinstaller_config/
+build/
+dist/
+*.spec
+
+# Local agent/tool metadata
+.agents/
