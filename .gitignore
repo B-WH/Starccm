@@ -27,6 +27,7 @@ env/
 cgns_pressure_output/
 
 # Generated mapped Abaqus files
+map_test_*.inp
 *_mapped.inp
 *_mapped_*Hz.inp
 *_loads.inc

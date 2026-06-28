@@ -3,6 +3,7 @@ import gc
 from pathlib import Path
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -12,7 +13,10 @@ from map_cgns_pressure_to_inp import (
     estimate_time_load_records,
     find_frequency_index,
     map_complex_pressure_to_nodes,
+    parse_args,
     parse_inp_text,
+    parse_frequency_text,
+    resolve_requested_frequencies,
     run_mapping,
     select_target_faces,
     write_frequency_load_include,
@@ -44,6 +48,11 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
             "mapping_report.json",
         ):
             _unlink_test_file(Path(name))
+
+    def test_gitignore_covers_input_fixture_file(self) -> None:
+        gitignore = Path(".gitignore").read_text(encoding="utf-8")
+
+        self.assertIn("map_test_*.inp", gitignore)
 
     def test_parse_inp_nodes_elements_sets_and_step_kind(self) -> None:
         model = parse_inp_text(
@@ -262,6 +271,52 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No extracted frequency"):
             find_frequency_index(np.array([95.0, 105.0]), 100.0, tolerance_hz=1.0)
 
+    def test_frequency_range_expands_inclusive_hz_values(self) -> None:
+        args = parse_args(
+            [
+                "--inp",
+                "model.inp",
+                "--extracted",
+                "out",
+                "--target-set",
+                "SURF",
+                "--target-set-type",
+                "elset",
+                "--frequency-range",
+                "1:800:1",
+            ]
+        )
+
+        frequencies = resolve_requested_frequencies(args)
+
+        self.assertEqual(len(frequencies), 800)
+        self.assertEqual(frequencies[0], 1.0)
+        self.assertEqual(frequencies[-1], 800.0)
+
+    def test_frequency_range_combines_with_single_frequency_values(self) -> None:
+        args = parse_args(
+            [
+                "--inp",
+                "model.inp",
+                "--extracted",
+                "out",
+                "--target-set",
+                "SURF",
+                "--target-set-type",
+                "elset",
+                "--frequency",
+                "0.5",
+                "--frequency-range",
+                "1:3:1",
+            ]
+        )
+
+        self.assertEqual(resolve_requested_frequencies(args), [0.5, 1.0, 2.0, 3.0])
+
+    def test_gui_frequency_text_accepts_comma_values_and_ranges(self) -> None:
+        self.assertEqual(parse_frequency_text("0.5, 1:3:1"), [0.5, 1.0, 2.0, 3.0])
+        self.assertIsNone(parse_frequency_text(""))
+
     def test_missing_target_set_is_rejected(self) -> None:
         model = parse_inp_text("*Node\n1,0,0,0\n*Step\n*Dynamic\n*End Step")
 
@@ -289,6 +344,83 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(transformed, [[16.0, -2.0, 3.0]])
+
+    def test_nearest_weight_lookup_uses_ckdtree_when_available(self) -> None:
+        from starccm_pressure import map_cgns_pressure_to_inp as mapper
+
+        calls: list[tuple[tuple[int, int], int]] = []
+
+        class FakeTree:
+            def __init__(self, points: np.ndarray) -> None:
+                self.points = np.asarray(points, dtype=float)
+
+            def query(self, targets: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+                calls.append((tuple(np.asarray(targets).shape), int(k)))
+                distances = np.array([[0.0, 2.0]], dtype=float)
+                indices = np.array([[1, 0]], dtype=int)
+                return distances, indices
+
+        target_centers = np.array([[1.0, 0.0, 0.0]], dtype=float)
+        source_centers = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=float)
+
+        with patch.object(mapper, "_load_ckdtree", return_value=FakeTree):
+            indices, weights = mapper._nearest_weights(target_centers, source_centers, k=2)
+
+        self.assertEqual(calls, [((1, 3), 2)])
+        np.testing.assert_array_equal(indices, [[1, 0]])
+        np.testing.assert_allclose(weights, [[1.0, 0.0]])
+
+    def test_mapping_report_documents_physical_mapping_assumptions(self) -> None:
+        inp_path = Path("map_test_model.inp")
+        output_path = Path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step, name=HARMONIC",
+                    "*Steady State Dynamics",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            "map_test_surface_geometry.npz",
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            coordinates=np.zeros((4, 3), dtype=float),
+            faces=np.array([[0, 1, 2, 3]], dtype=int),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+            areas=np.array([1.0], dtype=float),
+            normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        np.savez_compressed(
+            "map_test_pressure_complex_spectrum.npz",
+            frequencies_hz=np.array([100.0], dtype=float),
+            pressure_real=np.array([[8.0]], dtype=float),
+            pressure_imag=np.array([[6.0]], dtype=float),
+        )
+
+        run_mapping(
+            inp_path=inp_path,
+            extracted_dir=Path("."),
+            target_set="SURF",
+            target_set_type="elset",
+            frequencies=[100.0],
+            output_path=output_path,
+            surface_geometry_name="map_test_surface_geometry.npz",
+            complex_spectrum_name="map_test_pressure_complex_spectrum.npz",
+        )
+
+        report = json.loads(Path("mapping_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["mapping_assumptions"]["pressure_sign"], "-pressure * area_vector")
+        self.assertEqual(report["mapping_assumptions"]["node_force_distribution"], "equal_share_per_face_node")
+        self.assertIn("supported_element_scope", report["mapping_assumptions"])
 
 
 if __name__ == "__main__":

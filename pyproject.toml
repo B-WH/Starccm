@@ -1,0 +1,32 @@
+[project]
+name = "starccm-pressure-tools"
+version = "0.1.0"
+description = "STAR-CCM+ CGNS pressure extraction and Abaqus INP mapping utilities"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "h5py",
+    "scipy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "NPY", "UP", "B"]
+ignore = ["E501"]
+
+[tool.unittest]
+start-directory = "tests"
+pattern = "test_*.py"

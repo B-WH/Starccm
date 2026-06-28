@@ -3,6 +3,9 @@
 本仓库包含两个 Python 工具，用于把 STAR-CCM+ 导出的 HDF5-CGNS
 表面压力数据提取出来，并进一步映射到 Abaqus INP 结构模型。
 
+命令行入口仍保留在仓库根目录的两个脚本中，核心实现已拆分到
+`starccm_pressure/` 包内，便于复用和测试。
+
 ## 工具说明
 
 ### `extract_cgns_pressure.py`
@@ -58,6 +61,19 @@ python map_cgns_pressure_to_inp.py `
   --output model_mapped.inp
 ```
 
+若要映射连续频率范围，例如 `dt=0.0005 s`、2000 个时间步对应的 1 Hz 频率分辨率，
+可以使用包含端点的范围写法：
+
+```powershell
+python map_cgns_pressure_to_inp.py `
+  --inp model.inp `
+  --extracted cgns_pressure_output `
+  --target-set SURFACE `
+  --target-set-type elset `
+  --frequency-range 1:800:1 `
+  --output model_mapped.inp
+```
+
 对于 `*STEADY STATE DYNAMICS` 稳态动力学分析步，映射程序使用：
 
 - `surface_geometry.npz`
@@ -71,6 +87,16 @@ python map_cgns_pressure_to_inp.py `
 受载区域必须指定为 Abaqus 中已有的 `Nset` 或 `Elset`。程序不会默认
 把压力映射到全部节点，避免把内部节点或非受压区域错误加载。
 
+映射程序使用源/目标面心的反距离权重插值。安装 `scipy` 后会自动使用
+`scipy.spatial.cKDTree` 加速最近邻查询；如果当前环境没有 `scipy`，程序会回退到
+NumPy 全量距离扫描。
+
+`mapping_report.json` 会记录本次映射的主要物理假设：
+
+- 压力等效面力方向为 `-pressure * area_vector`。
+- 面力按该面的节点数量平均分配到节点。
+- 当前适用范围是线性壳/面单元，以及一阶 `C3D4`/`C3D8` 实体外表面。
+
 ## 安装依赖
 
 建议使用 Python 3.11+，或使用项目本地虚拟环境。安装依赖：
@@ -81,6 +107,25 @@ pip install -r requirements.txt
 
 `tkinter`、`argparse`、`gzip` 和 `json` 属于 Python 标准库，不写入
 `requirements.txt`。
+
+## 打包 EXE
+
+Windows 下可使用 PyInstaller 打包两个命令行工具：
+
+```powershell
+pip install -r requirements.txt
+pip install pyinstaller
+.\packaging\build_exe.ps1
+```
+
+输出文件位于 `dist/`：
+
+- `extract_cgns_pressure_cli.exe`：命令行提取工具，适合批处理。
+- `extract_cgns_pressure_gui.exe`：双击打开提取 GUI。
+- `map_cgns_pressure_to_inp_cli.exe`：命令行映射工具，适合批处理。
+- `map_cgns_pressure_to_inp_gui.exe`：双击打开映射 GUI。
+
+映射 GUI 的频率输入框支持单个频率、逗号分隔频率和范围，例如 `1:800:1`。
 
 ## 测试
 
@@ -110,8 +155,10 @@ python -B -m unittest tests.test_extract_cgns_pressure tests.test_map_cgns_press
 
 - `extract_cgns_pressure.py`
 - `map_cgns_pressure_to_inp.py`
+- `starccm_pressure/`
 - `tests/test_extract_cgns_pressure.py`
 - `tests/test_map_cgns_pressure_to_inp.py`
 - `.gitignore`
 - `README.md`
 - `requirements.txt`
+- `pyproject.toml`
