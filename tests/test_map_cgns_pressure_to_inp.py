@@ -9,7 +9,9 @@ import numpy as np
 
 from map_cgns_pressure_to_inp import (
     FileSizeLimitError,
+    apply_global_conservation_correction,
     apply_coordinate_transform,
+    compute_node_force_moment,
     estimate_time_load_records,
     find_frequency_index,
     map_complex_pressure_to_nodes,
@@ -19,6 +21,7 @@ from map_cgns_pressure_to_inp import (
     resolve_requested_frequencies,
     run_mapping,
     select_target_faces,
+    transform_area_vectors,
     write_frequency_load_include,
 )
 
@@ -31,6 +34,25 @@ def _unlink_test_file(path: Path) -> None:
         except PermissionError:
             gc.collect()
             time.sleep(0.05)
+
+
+def _read_real_cloads(path: Path) -> dict[int, np.ndarray]:
+    forces: dict[int, np.ndarray] = {}
+    in_real = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("*CLOAD, REAL"):
+            in_real = True
+            continue
+        if stripped.upper().startswith("*CLOAD, IMAGINARY"):
+            break
+        if not in_real or not stripped or stripped.startswith("**"):
+            continue
+        node_text, component_text, value_text = [part.strip() for part in stripped.split(",")]
+        node_id = int(node_text)
+        component = int(component_text) - 1
+        forces.setdefault(node_id, np.zeros(3, dtype=float))[component] = float(value_text)
+    return forces
 
 
 class MapCgnsPressureToInpTests(unittest.TestCase):
@@ -109,6 +131,14 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         np.testing.assert_allclose(faces.centers, [[0.5, 0.5, 0.0]])
         np.testing.assert_allclose(faces.area_vectors, [[0.0, 0.0, 1.0]])
 
+    def test_transform_area_vectors_scales_area_by_square_of_coordinate_scale(self) -> None:
+        transformed = transform_area_vectors(
+            np.array([[0.0, 0.0, 1.0]], dtype=float),
+            scale=2.0,
+        )
+
+        np.testing.assert_allclose(transformed, [[0.0, 0.0, 4.0]])
+
     def test_map_complex_pressure_to_nodes_conserves_total_force(self) -> None:
         target_centers = np.array([[0.5, 0.5, 0.0]], dtype=float)
         target_area_vectors = np.array([[0.0, 0.0, 2.0]], dtype=float)
@@ -129,6 +159,143 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         np.testing.assert_allclose(total, [0.0 + 0.0j, 0.0 + 0.0j, -6.0 - 8.0j])
         np.testing.assert_allclose(node_forces[1], [0.0 + 0.0j, 0.0 + 0.0j, -1.5 - 2.0j])
         self.assertEqual(stats["target_face_count"], 1)
+
+    def test_map_complex_pressure_to_nodes_uses_consistent_quad_nodal_forces(self) -> None:
+        target_centers = np.array([[0.5, 0.5, 0.0]], dtype=float)
+        target_area_vectors = np.array([[0.0, 0.0, 1.0]], dtype=float)
+        target_node_ids = [[1, 2, 3, 4]]
+        target_face_points = [
+            np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ],
+                dtype=float,
+            )
+        ]
+        gauss = 1.0 / np.sqrt(3.0)
+        natural_points = [(-gauss, -gauss), (gauss, -gauss), (gauss, gauss), (-gauss, gauss)]
+        source_centers = np.array(
+            [[0.5 * (1.0 + xi), 0.5 * (1.0 + eta), 0.0] for xi, eta in natural_points],
+            dtype=float,
+        )
+        source_pressure = source_centers[:, 0].astype(complex)
+
+        node_forces, stats = map_complex_pressure_to_nodes(
+            target_centers,
+            target_area_vectors,
+            target_node_ids,
+            source_centers,
+            source_pressure,
+            k=1,
+            target_face_points=target_face_points,
+        )
+
+        np.testing.assert_allclose(node_forces[1], [0.0, 0.0, -1.0 / 12.0])
+        np.testing.assert_allclose(node_forces[2], [0.0, 0.0, -1.0 / 6.0])
+        np.testing.assert_allclose(node_forces[3], [0.0, 0.0, -1.0 / 6.0])
+        np.testing.assert_allclose(node_forces[4], [0.0, 0.0, -1.0 / 12.0])
+        np.testing.assert_allclose(
+            sum(node_forces.values(), np.zeros(3, dtype=complex)),
+            [0.0, 0.0, -0.5],
+        )
+        self.assertEqual(stats["integration_point_count"], 4)
+
+    def test_global_conservation_correction_matches_force_and_moment(self) -> None:
+        node_forces = {
+            1: np.array([0.0 + 0.0j, 0.0 + 0.0j, -0.5 - 0.25j]),
+            2: np.array([0.0 + 0.0j, 0.0 + 0.0j, -0.5 - 0.25j]),
+            3: np.array([0.0 + 0.0j, 0.0 + 0.0j, -0.5 - 0.25j]),
+            4: np.array([0.0 + 0.0j, 0.0 + 0.0j, -0.5 - 0.25j]),
+        }
+        node_coordinates = {
+            1: np.array([0.0, 0.0, 0.0]),
+            2: np.array([1.0, 0.0, 0.0]),
+            3: np.array([1.0, 1.0, 0.0]),
+            4: np.array([0.0, 1.0, 0.0]),
+        }
+        desired_force = np.array([1.0 + 2.0j, -0.5 + 0.25j, -4.0 - 1.0j])
+        desired_moment = np.array([-2.0 - 0.5j, 2.0 + 1.0j, 0.75 - 0.25j])
+
+        corrected, stats = apply_global_conservation_correction(
+            node_forces,
+            node_coordinates,
+            desired_force,
+            desired_moment,
+        )
+
+        force, moment = compute_node_force_moment(corrected, node_coordinates)
+        np.testing.assert_allclose(force, desired_force, atol=1.0e-12)
+        np.testing.assert_allclose(moment, desired_moment, atol=1.0e-12)
+        self.assertGreater(stats["force_residual_norm_before"], 0.0)
+        self.assertLess(stats["force_residual_norm_after"], 1.0e-12)
+        self.assertLess(stats["moment_residual_norm_after"], 1.0e-12)
+
+    def test_run_mapping_applies_global_force_and_moment_conservation(self) -> None:
+        inp_path = Path("map_test_model.inp")
+        output_path = Path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step, name=HARMONIC",
+                    "*Steady State Dynamics",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            "map_test_surface_geometry.npz",
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            coordinates=np.zeros((4, 3), dtype=float),
+            faces=np.array([[0, 1, 2]], dtype=int),
+            area_vectors=np.array([[0.0, 0.0, 2.0]], dtype=float),
+            areas=np.array([2.0], dtype=float),
+            normals=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        np.savez_compressed(
+            "map_test_pressure_complex_spectrum.npz",
+            frequencies_hz=np.array([100.0], dtype=float),
+            pressure_real=np.array([[5.0]], dtype=float),
+            pressure_imag=np.array([[0.0]], dtype=float),
+        )
+
+        run_mapping(
+            inp_path=inp_path,
+            extracted_dir=Path("."),
+            target_set="SURF",
+            target_set_type="elset",
+            frequencies=[100.0],
+            output_path=output_path,
+            surface_geometry_name="map_test_surface_geometry.npz",
+            complex_spectrum_name="map_test_pressure_complex_spectrum.npz",
+        )
+
+        node_coordinates = {
+            1: np.array([0.0, 0.0, 0.0]),
+            2: np.array([1.0, 0.0, 0.0]),
+            3: np.array([1.0, 1.0, 0.0]),
+            4: np.array([0.0, 1.0, 0.0]),
+        }
+        force, moment = compute_node_force_moment(
+            _read_real_cloads(Path("map_test_model_mapped_loads.inc")),
+            node_coordinates,
+        )
+        np.testing.assert_allclose(force, [0.0, 0.0, -10.0], atol=1.0e-10)
+        np.testing.assert_allclose(moment, [-5.0, 5.0, 0.0], atol=1.0e-10)
+        report = json.loads(Path("mapping_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["mapping_stats"]["conservation_enabled"], 1)
+        self.assertLess(report["mapping_stats"]["force_residual_norm_after"], 1.0e-10)
+        self.assertLess(report["mapping_stats"]["moment_residual_norm_after"], 1.0e-10)
 
     def test_write_frequency_load_include_writes_real_and_imag_cloads(self) -> None:
         include_path = Path("map_test_model_mapped_loads.inc")
@@ -419,7 +586,14 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
 
         report = json.loads(Path("mapping_report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["mapping_assumptions"]["pressure_sign"], "-pressure * area_vector")
-        self.assertEqual(report["mapping_assumptions"]["node_force_distribution"], "equal_share_per_face_node")
+        self.assertEqual(
+            report["mapping_assumptions"]["node_force_distribution"],
+            "consistent_shape_function_integration",
+        )
+        self.assertEqual(
+            report["mapping_assumptions"]["global_conservation"],
+            "minimum_norm_total_force_and_moment_correction",
+        )
         self.assertIn("supported_element_scope", report["mapping_assumptions"])
 
 

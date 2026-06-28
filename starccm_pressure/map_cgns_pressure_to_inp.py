@@ -92,11 +92,13 @@ class TargetFaces:
 
     Attributes:
         node_ids: 每个目标面的节点编号。
+        face_points: 每个目标面的节点坐标，顺序与 node_ids 一致。
         centers: 目标面中心坐标。
         area_vectors: 目标面面积向量，方向用于确定压力等效力方向。
     """
 
     node_ids: list[list[int]]
+    face_points: list[np.ndarray]
     centers: np.ndarray
     area_vectors: np.ndarray
 
@@ -438,15 +440,18 @@ def select_target_faces(
 
     centers: list[np.ndarray] = []
     area_vectors: list[np.ndarray] = []
+    face_points: list[np.ndarray] = []
     for face in selected_faces:
         try:
             points = np.vstack([model.nodes[node_id] for node_id in face])
         except KeyError as exc:
             raise ValueError(f"Face references missing node {exc.args[0]}.") from exc
+        face_points.append(points)
         centers.append(np.mean(points, axis=0))
         area_vectors.append(_area_vector(points))
     return TargetFaces(
         node_ids=selected_faces,
+        face_points=face_points,
         centers=np.vstack(centers),
         area_vectors=np.vstack(area_vectors),
     )
@@ -484,6 +489,41 @@ def apply_coordinate_transform(
     if translate is not None:
         transformed = transformed + np.asarray(translate, dtype=float)
     return transformed
+
+
+def _coordinate_transform_matrix(
+    scale: float = 1.0,
+    axis_order: tuple[int, int, int] = (0, 1, 2),
+    axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> np.ndarray:
+    if sorted(axis_order) != [0, 1, 2]:
+        raise ValueError("axis_order must be a permutation of 0, 1, 2.")
+    matrix = np.zeros((3, 3), dtype=float)
+    for row, source_axis in enumerate(axis_order):
+        matrix[row, source_axis] = float(axis_sign[row]) * float(scale)
+    return matrix
+
+
+def transform_area_vectors(
+    area_vectors: np.ndarray,
+    scale: float = 1.0,
+    axis_order: tuple[int, int, int] = (0, 1, 2),
+    axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0),
+) -> np.ndarray:
+    """将 CGNS 有向面积矢量转换到 INP 坐标系。"""
+    values = np.asarray(area_vectors, dtype=float)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError("area_vectors must have shape (N, 3).")
+    matrix = _coordinate_transform_matrix(
+        scale=scale,
+        axis_order=axis_order,
+        axis_sign=axis_sign,
+    )
+    determinant = float(np.linalg.det(matrix))
+    if determinant == 0.0:
+        raise ValueError("scale must be non-zero for area vector transformation.")
+    area_transform = determinant * np.linalg.inv(matrix).T
+    return values @ area_transform.T
 
 
 def _load_ckdtree() -> Any | None:
@@ -647,6 +687,248 @@ def pressure_faces_to_node_forces(
     return forces
 
 
+def _tri3_quadrature(points: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    area_vector = 0.5 * np.cross(points[1] - points[0], points[2] - points[0])
+    barycentric_points = np.array(
+        [
+            [2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0],
+            [1.0 / 6.0, 2.0 / 3.0, 1.0 / 6.0],
+            [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0],
+        ],
+        dtype=float,
+    )
+    return [
+        (shape, shape @ points, area_vector / 3.0)
+        for shape in barycentric_points
+    ]
+
+
+def _quad4_shape_functions(xi: float, eta: float) -> np.ndarray:
+    return 0.25 * np.array(
+        [
+            (1.0 - xi) * (1.0 - eta),
+            (1.0 + xi) * (1.0 - eta),
+            (1.0 + xi) * (1.0 + eta),
+            (1.0 - xi) * (1.0 + eta),
+        ],
+        dtype=float,
+    )
+
+
+def _quad4_shape_derivatives(xi: float, eta: float) -> tuple[np.ndarray, np.ndarray]:
+    dxi = 0.25 * np.array(
+        [-(1.0 - eta), 1.0 - eta, 1.0 + eta, -(1.0 + eta)],
+        dtype=float,
+    )
+    deta = 0.25 * np.array(
+        [-(1.0 - xi), -(1.0 + xi), 1.0 + xi, 1.0 - xi],
+        dtype=float,
+    )
+    return dxi, deta
+
+
+def _quad4_quadrature(points: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    gauss = 1.0 / np.sqrt(3.0)
+    result: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for xi, eta in [(-gauss, -gauss), (gauss, -gauss), (gauss, gauss), (-gauss, gauss)]:
+        shape = _quad4_shape_functions(xi, eta)
+        dxi, deta = _quad4_shape_derivatives(xi, eta)
+        dx_dxi = dxi @ points
+        dx_deta = deta @ points
+        area_vector_weight = np.cross(dx_dxi, dx_deta)
+        result.append((shape, shape @ points, area_vector_weight))
+    return result
+
+
+def _face_quadrature(points: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("target face points must have shape (N, 3).")
+    if points.shape[0] == 3:
+        return _tri3_quadrature(points)
+    if points.shape[0] == 4:
+        return _quad4_quadrature(points)
+    raise ValueError("Consistent nodal force integration supports only 3- or 4-node faces.")
+
+
+def pressure_faces_to_consistent_node_forces(
+    target_face_points: list[np.ndarray],
+    target_node_ids: list[list[int]],
+    source_centers: np.ndarray,
+    source_pressure: np.ndarray,
+    k: int = 4,
+) -> tuple[dict[int, np.ndarray], dict[str, float]]:
+    """将面压力通过形函数积分为一致等效节点力。
+
+    压力先在每个目标面的积分点上由 CGNS 源面心插值得到，再按
+    `F_i = -∫ N_i p n dA` 累积到该面的节点。
+    """
+    if len(target_face_points) != len(target_node_ids):
+        raise ValueError("target_face_points length must match target_node_ids.")
+
+    integration_points: list[np.ndarray] = []
+    integration_terms: list[tuple[list[int], np.ndarray, np.ndarray]] = []
+    for points, node_ids in zip(target_face_points, target_node_ids):
+        point_array = np.asarray(points, dtype=float)
+        if point_array.shape[0] != len(node_ids):
+            raise ValueError("Each target face must have the same number of points and nodes.")
+        for shape, location, area_vector_weight in _face_quadrature(point_array):
+            integration_points.append(location)
+            integration_terms.append((node_ids, shape, area_vector_weight))
+
+    pressure_at_points, distance_stats = interpolate_pressure_to_faces(
+        np.vstack(integration_points),
+        source_centers,
+        source_pressure,
+        k=k,
+    )
+
+    forces: dict[int, np.ndarray] = {}
+    for pressure, (node_ids, shape, area_vector_weight) in zip(
+        pressure_at_points,
+        integration_terms,
+    ):
+        force_weight = -pressure * area_vector_weight
+        for local_index, node_id in enumerate(node_ids):
+            contribution = shape[local_index] * force_weight
+            if node_id not in forces:
+                forces[node_id] = np.zeros(3, dtype=np.asarray(contribution).dtype)
+            forces[node_id] = forces[node_id] + contribution
+    return forces, distance_stats
+
+
+def compute_face_force_moment(
+    centers: np.ndarray,
+    area_vectors: np.ndarray,
+    pressures: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute total force and moment from face pressures.
+
+    The force convention matches the mapping load convention:
+    `face_force = -pressure * area_vector`.
+    """
+    center_array = np.asarray(centers, dtype=float)
+    area_array = np.asarray(area_vectors, dtype=float)
+    pressure_array = np.asarray(pressures)
+    if center_array.ndim != 2 or center_array.shape[1] != 3:
+        raise ValueError("centers must have shape (N, 3).")
+    if area_array.shape != center_array.shape:
+        raise ValueError("area_vectors must have the same shape as centers.")
+    if pressure_array.shape[0] != center_array.shape[0]:
+        raise ValueError("pressures length must match centers.")
+    face_forces = -pressure_array[:, np.newaxis] * area_array
+    return (
+        np.sum(face_forces, axis=0),
+        np.sum(np.cross(center_array, face_forces), axis=0),
+    )
+
+
+def compute_node_force_moment(
+    node_forces: dict[int, np.ndarray],
+    node_coordinates: dict[int, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute total force and moment from nodal concentrated forces."""
+    if not node_forces:
+        raise ValueError("node_forces must not be empty.")
+    dtype = np.result_type(*[np.asarray(force).dtype for force in node_forces.values()])
+    total_force = np.zeros(3, dtype=dtype)
+    total_moment = np.zeros(3, dtype=dtype)
+    for node_id, force in node_forces.items():
+        if node_id not in node_coordinates:
+            raise ValueError(f"Missing coordinates for node {node_id}.")
+        force_array = np.asarray(force, dtype=dtype)
+        coordinate = np.asarray(node_coordinates[node_id], dtype=float)
+        if force_array.shape != (3,) or coordinate.shape != (3,):
+            raise ValueError("node force and coordinate entries must be length-3 vectors.")
+        total_force += force_array
+        total_moment += np.cross(coordinate, force_array)
+    return total_force, total_moment
+
+
+def _cross_matrix(vector: np.ndarray) -> np.ndarray:
+    x, y, z = np.asarray(vector, dtype=float)
+    return np.array(
+        [
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ],
+        dtype=float,
+    )
+
+
+def _node_coordinates_from_faces(
+    target_node_ids: list[list[int]],
+    target_face_points: list[np.ndarray],
+) -> dict[int, np.ndarray]:
+    if len(target_node_ids) != len(target_face_points):
+        raise ValueError("target_node_ids and target_face_points must have matching lengths.")
+    coordinates: dict[int, np.ndarray] = {}
+    for node_ids, points in zip(target_node_ids, target_face_points):
+        point_array = np.asarray(points, dtype=float)
+        if point_array.shape[0] != len(node_ids) or point_array.shape[1] != 3:
+            raise ValueError("Each target face must have matching node ids and 3D points.")
+        for node_id, coordinate in zip(node_ids, point_array):
+            if node_id in coordinates and not np.allclose(coordinates[node_id], coordinate):
+                raise ValueError(f"Node {node_id} has inconsistent coordinates across faces.")
+            coordinates[node_id] = coordinate
+    return coordinates
+
+
+def apply_global_conservation_correction(
+    node_forces: dict[int, np.ndarray],
+    node_coordinates: dict[int, np.ndarray],
+    desired_force: np.ndarray,
+    desired_moment: np.ndarray,
+) -> tuple[dict[int, np.ndarray], dict[str, float]]:
+    """Apply a minimum-norm correction that conserves total force and moment."""
+    if not node_forces:
+        raise ValueError("node_forces must not be empty.")
+    node_ids = sorted(node_forces)
+    dtype = np.result_type(
+        np.asarray(desired_force).dtype,
+        np.asarray(desired_moment).dtype,
+        *[np.asarray(node_forces[node_id]).dtype for node_id in node_ids],
+    )
+    current_force, current_moment = compute_node_force_moment(node_forces, node_coordinates)
+    desired_force_array = np.asarray(desired_force, dtype=dtype)
+    desired_moment_array = np.asarray(desired_moment, dtype=dtype)
+    residual = np.concatenate(
+        [
+            desired_force_array - current_force,
+            desired_moment_array - current_moment,
+        ]
+    )
+
+    constraint = np.zeros((6, 3 * len(node_ids)), dtype=float)
+    for index, node_id in enumerate(node_ids):
+        coordinate = np.asarray(node_coordinates[node_id], dtype=float)
+        block = slice(3 * index, 3 * index + 3)
+        constraint[0:3, block] = np.eye(3)
+        constraint[3:6, block] = _cross_matrix(coordinate)
+
+    gram = constraint @ constraint.T
+    correction_flat = constraint.T @ (np.linalg.pinv(gram) @ residual)
+    corrected = {
+        node_id: np.asarray(node_forces[node_id], dtype=dtype).copy()
+        for node_id in node_ids
+    }
+    for index, node_id in enumerate(node_ids):
+        corrected[node_id] = corrected[node_id] + correction_flat[3 * index : 3 * index + 3]
+
+    corrected_force, corrected_moment = compute_node_force_moment(corrected, node_coordinates)
+    force_residual_before = desired_force_array - current_force
+    moment_residual_before = desired_moment_array - current_moment
+    force_residual_after = desired_force_array - corrected_force
+    moment_residual_after = desired_moment_array - corrected_moment
+    return corrected, {
+        "force_residual_norm_before": float(np.linalg.norm(force_residual_before)),
+        "moment_residual_norm_before": float(np.linalg.norm(moment_residual_before)),
+        "force_residual_norm_after": float(np.linalg.norm(force_residual_after)),
+        "moment_residual_norm_after": float(np.linalg.norm(moment_residual_after)),
+        "constraint_rank": int(np.linalg.matrix_rank(constraint)),
+    }
+
+
 def map_complex_pressure_to_nodes(
     target_centers: np.ndarray,
     target_area_vectors: np.ndarray,
@@ -654,6 +936,9 @@ def map_complex_pressure_to_nodes(
     source_centers: np.ndarray,
     source_pressure: np.ndarray,
     k: int = 4,
+    target_face_points: list[np.ndarray] | None = None,
+    source_area_vectors: np.ndarray | None = None,
+    apply_conservation: bool = True,
 ) -> tuple[dict[int, np.ndarray], dict[str, float | int]]:
     """完成频域压力到节点复数力的一步映射。
 
@@ -664,26 +949,61 @@ def map_complex_pressure_to_nodes(
         source_centers: CGNS 源表面面心。
         source_pressure: CGNS 源表面复数压力。
         k: 反距离插值使用的最近邻数量。
+        target_face_points: 结构目标面节点坐标；提供时使用一致等效节点力积分。
+        source_area_vectors: CGNS 源表面面积矢量；提供时可做全局保守修正。
+        apply_conservation: 是否启用总力和总力矩保守修正。
 
     Returns:
         `(节点复数力, 映射统计信息)`。
     """
-    face_pressure, distance_stats = interpolate_pressure_to_faces(
-        target_centers,
-        source_centers,
-        source_pressure,
-        k=k,
-    )
-    node_forces = pressure_faces_to_node_forces(
-        face_pressure,
-        target_area_vectors,
-        target_node_ids,
-    )
+    if target_face_points is None:
+        face_pressure, distance_stats = interpolate_pressure_to_faces(
+            target_centers,
+            source_centers,
+            source_pressure,
+            k=k,
+        )
+        node_forces = pressure_faces_to_node_forces(
+            face_pressure,
+            target_area_vectors,
+            target_node_ids,
+        )
+        integration_point_count = int(len(target_node_ids))
+    else:
+        node_forces, distance_stats = pressure_faces_to_consistent_node_forces(
+            target_face_points,
+            target_node_ids,
+            source_centers,
+            source_pressure,
+            k=k,
+        )
+        integration_point_count = sum(
+            3 if np.asarray(points).shape[0] == 3 else 4
+            for points in target_face_points
+        )
     stats: dict[str, float | int] = {
         "target_face_count": int(len(target_node_ids)),
         "target_node_count": int(len(node_forces)),
         "source_face_count": int(np.asarray(source_centers).shape[0]),
+        "integration_point_count": integration_point_count,
     }
+    if apply_conservation and source_area_vectors is not None and target_face_points is not None:
+        source_force, source_moment = compute_face_force_moment(
+            source_centers,
+            source_area_vectors,
+            source_pressure,
+        )
+        node_coordinates = _node_coordinates_from_faces(target_node_ids, target_face_points)
+        node_forces, conservation_stats = apply_global_conservation_correction(
+            node_forces,
+            node_coordinates,
+            source_force,
+            source_moment,
+        )
+        stats["conservation_enabled"] = 1
+        stats.update(conservation_stats)
+    else:
+        stats["conservation_enabled"] = 0
     stats.update(distance_stats)
     return node_forces, stats
 
@@ -952,8 +1272,9 @@ def _mapping_assumptions() -> dict[str, str]:
     """Describe the physical assumptions used by the pressure mapping."""
     return {
         "pressure_sign": "-pressure * area_vector",
-        "node_force_distribution": "equal_share_per_face_node",
-        "interpolation": "inverse_distance_weighting_on_face_centers",
+        "node_force_distribution": "consistent_shape_function_integration",
+        "interpolation": "inverse_distance_weighting_at_face_integration_points",
+        "global_conservation": "minimum_norm_total_force_and_moment_correction",
         "supported_element_scope": "linear shell/surface elements and first-order C3D4/C3D8 exterior faces",
     }
 
@@ -1018,6 +1339,7 @@ def run_mapping(
     complex_spectrum_name: str = "pressure_complex_spectrum.npz",
     pressure_time_name: str = "pressure_time.json.gz",
     report_name: str = "mapping_report.json",
+    conserve_global_loads: bool = True,
 ) -> MappingResult:
     """执行完整压力映射流程并写出新 INP。
 
@@ -1044,6 +1366,7 @@ def run_mapping(
         complex_spectrum_name: 复数压力谱 NPZ 文件名。
         pressure_time_name: 时域压力 gzip JSON 文件名。
         report_name: 映射报告文件名。
+        conserve_global_loads: 是否修正节点力以守恒源 CGNS 总力和总力矩。
 
     Returns:
         输出 INP、include 和报告路径。
@@ -1064,11 +1387,17 @@ def run_mapping(
     model = parse_inp_file(inp)
     step = _load_model_step(model, step_name)
     target_faces = select_target_faces(model, target_set, target_set_type)
-    source_centers, _source_area_vectors = _load_surface_geometry(extracted, surface_geometry_name)
+    source_centers, source_area_vectors = _load_surface_geometry(extracted, surface_geometry_name)
     transformed_source_centers = apply_coordinate_transform(
         source_centers,
         scale=scale,
         translate=translate,
+        axis_order=axis_order,
+        axis_sign=axis_sign,
+    )
+    transformed_source_area_vectors = transform_area_vectors(
+        source_area_vectors,
+        scale=scale,
         axis_order=axis_order,
         axis_sign=axis_sign,
     )
@@ -1120,6 +1449,9 @@ def run_mapping(
                 transformed_source_centers,
                 pressure_spectrum[spectrum_index],
                 k=k,
+                target_face_points=target_faces.face_points,
+                source_area_vectors=transformed_source_area_vectors,
+                apply_conservation=conserve_global_loads,
             )
             write_frequency_load_include(
                 include_path,
@@ -1158,6 +1490,9 @@ def run_mapping(
                 transformed_source_centers,
                 pressure_time[time_index],
                 k=k,
+                target_face_points=target_faces.face_points,
+                source_area_vectors=transformed_source_area_vectors,
+                apply_conservation=conserve_global_loads,
             )
             for node_id, force in node_forces.items():
                 if node_id not in node_series:
