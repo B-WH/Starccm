@@ -15,15 +15,19 @@ CGNS 文件。稳态动力学使用 `surface_geometry.npz` 和
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import gzip
 import json
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Literal
 
 import numpy as np
+
+from starccm_pressure.optional_deps import load_ckdtree
 
 
 StepKind = Literal["steady_state", "dynamic_explicit", "dynamic", "unknown"]
@@ -118,6 +122,40 @@ class MappingResult:
     output_inp_paths: list[Path]
     include_paths: list[Path]
     report_path: Path
+
+
+@dataclass(frozen=True)
+class AlignmentPreview:
+    """CGNS 与 INP 目标区域的位置预览数据。"""
+
+    source_centers: np.ndarray
+    target_centers: np.ndarray
+    target_nodes: np.ndarray
+    source_count: int
+    target_face_count: int
+    target_node_count: int
+    bounds_min: np.ndarray
+    bounds_max: np.ndarray
+    nearest_distance_min: float
+    nearest_distance_mean: float
+    nearest_distance_max: float
+
+
+@dataclass(frozen=True)
+class ConsistentForcePlan:
+    indices: np.ndarray
+    weights: np.ndarray
+    distance_stats: dict[str, float]
+    source_count: int
+    node_ids: np.ndarray
+    scatter_point_indices: np.ndarray
+    scatter_node_indices: np.ndarray
+    scatter_shape_values: np.ndarray
+    scatter_area_vectors: np.ndarray
+
+    @property
+    def integration_point_count(self) -> int:
+        return int(self.indices.shape[0])
 
 
 def _keyword_name(line: str) -> str:
@@ -428,7 +466,20 @@ def select_target_faces(
         if normalized_set not in model.nsets:
             raise ValueError(f"Target nset '{target_set}' was not found.")
         selected_nodes = model.nsets[normalized_set]
-        for element in model.elements.values():
+        # Build a node→element reverse index so we only examine elements
+        # that reference at least one node in the target nset.  Without
+        # this, every select_target_faces call would scan every element in
+        # the model — a major bottleneck for large INP files where the
+        # wetted surface is a small fraction of the total element count.
+        node_to_element_ids: dict[int, set[int]] = {}
+        for element_id, element in model.elements.items():
+            for node_id in element.node_ids:
+                node_to_element_ids.setdefault(node_id, set()).add(element_id)
+        candidate_ids: set[int] = set()
+        for node_id in selected_nodes:
+            candidate_ids.update(node_to_element_ids.get(node_id, ()))
+        for element_id in candidate_ids:
+            element = model.elements[element_id]
             for face in _element_face_node_ids(element):
                 if all(node_id in selected_nodes for node_id in face):
                     selected_faces.append(face)
@@ -528,11 +579,14 @@ def transform_area_vectors(
 
 def _load_ckdtree() -> Any | None:
     """Return scipy.spatial.cKDTree when SciPy is installed, otherwise None."""
+    return load_ckdtree()
+
+
+def _query_ckdtree(tree: Any, points: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
     try:
-        from scipy.spatial import cKDTree
-    except Exception:
-        return None
-    return cKDTree
+        return tree.query(points, k=k, workers=-1)
+    except TypeError:
+        return tree.query(points, k=k)
 
 
 def _nearest_weights_bruteforce(
@@ -540,22 +594,46 @@ def _nearest_weights_bruteforce(
     source_centers: np.ndarray,
     neighbor_count: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute inverse-distance nearest weights with a NumPy full-distance scan."""
-    indices = np.empty((target_centers.shape[0], neighbor_count), dtype=int)
-    weights = np.empty((target_centers.shape[0], neighbor_count), dtype=float)
-    for row, target in enumerate(target_centers):
-        distances = np.linalg.norm(source_centers - target, axis=1)
-        nearest = np.argpartition(distances, neighbor_count - 1)[:neighbor_count]
-        nearest = nearest[np.argsort(distances[nearest])]
-        nearest_distances = distances[nearest]
-        if nearest_distances[0] <= 1.0e-12:
-            row_weights = np.zeros(neighbor_count, dtype=float)
-            row_weights[0] = 1.0
-        else:
-            inverse = 1.0 / nearest_distances
-            row_weights = inverse / np.sum(inverse)
-        indices[row] = nearest
-        weights[row] = row_weights
+    """Compute inverse-distance nearest weights with chunked vectorized scan.
+
+    Processes targets in memory-bounded chunks to avoid both the Python-loop
+    overhead of a per-row scan and the O(N_targets * N_sources) peak memory
+    of a single full-distance matrix.
+    """
+    n_targets = target_centers.shape[0]
+    n_sources = source_centers.shape[0]
+    indices = np.empty((n_targets, neighbor_count), dtype=int)
+    weights = np.empty((n_targets, neighbor_count), dtype=float)
+
+    max_pairs_per_chunk = 2_000_000
+    chunk_size = max(1, min(n_targets, max_pairs_per_chunk // max(n_sources, 1)))
+
+    for start in range(0, n_targets, chunk_size):
+        stop = min(start + chunk_size, n_targets)
+        chunk = target_centers[start:stop]  # (C, 3)
+        # (C, S) distance matrix — single vectorized call per chunk
+        delta = chunk[:, np.newaxis, :] - source_centers[np.newaxis, :, :]
+        distances = np.sqrt(np.sum(delta * delta, axis=2))
+
+        # 每行取最近 k 个并排序
+        col_idx = np.argpartition(distances, neighbor_count - 1, axis=1)[
+            :, :neighbor_count
+        ]
+        row_idx = np.arange(col_idx.shape[0])[:, np.newaxis]
+        sorted_order = np.argsort(distances[row_idx, col_idx], axis=1)
+        nearest = col_idx[row_idx, sorted_order]  # (C, k)
+        nearest_distances = distances[row_idx, nearest]  # (C, k)
+
+        # 反距离权重
+        exact = nearest_distances[:, 0] <= 1.0e-12
+        inv = 1.0 / np.maximum(nearest_distances, np.finfo(float).tiny)
+        w = inv / np.sum(inv, axis=1, keepdims=True)
+        w[exact, :] = 0.0
+        w[exact, 0] = 1.0
+
+        indices[start:stop] = nearest
+        weights[start:stop] = w
+
     return indices, weights
 
 
@@ -584,10 +662,7 @@ def _nearest_weights(
             neighbor_count,
         )
 
-    distances, indices = tree_type(source_centers).query(
-        target_centers,
-        k=neighbor_count,
-    )
+    distances, indices = _query_ckdtree(tree_type(source_centers), target_centers, neighbor_count)
     distances = np.asarray(distances, dtype=float)
     indices = np.asarray(indices, dtype=int)
     if neighbor_count == 1:
@@ -607,6 +682,41 @@ def _nearest_weights(
             keepdims=True,
         )
     return indices, weights
+
+
+def _nearest_distances(source_points: np.ndarray, target_points: np.ndarray) -> np.ndarray:
+    """Return the nearest target distance for every source point."""
+    sources = np.asarray(source_points, dtype=float)
+    targets = np.asarray(target_points, dtype=float)
+    if sources.ndim != 2 or sources.shape[1] != 3:
+        raise ValueError("source_points must have shape (N, 3).")
+    if targets.ndim != 2 or targets.shape[1] != 3:
+        raise ValueError("target_points must have shape (N, 3).")
+    if sources.shape[0] == 0 or targets.shape[0] == 0:
+        raise ValueError("source_points and target_points must not be empty.")
+
+    tree_type = _load_ckdtree()
+    if tree_type is not None:
+        distances, _indices = _query_ckdtree(tree_type(targets), sources, 1)
+        return np.asarray(distances, dtype=float)
+
+    distances = np.empty(sources.shape[0], dtype=float)
+    max_pairs_per_chunk = 2_000_000
+    chunk_size = max(1, min(sources.shape[0], max_pairs_per_chunk // targets.shape[0]))
+    for start in range(0, sources.shape[0], chunk_size):
+        stop = min(start + chunk_size, sources.shape[0])
+        delta = sources[start:stop, np.newaxis, :] - targets[np.newaxis, :, :]
+        distance_squared = np.sum(delta * delta, axis=2)
+        distances[start:stop] = np.sqrt(np.min(distance_squared, axis=1))
+    return distances
+
+
+def _sample_rows_evenly(points: np.ndarray, limit: int) -> np.ndarray:
+    """Return up to limit rows while preserving the original array for small inputs."""
+    if limit <= 0 or points.shape[0] <= limit:
+        return points
+    indices = np.linspace(0, points.shape[0] - 1, limit).astype(int)
+    return points[indices]
 
 
 def interpolate_pressure_to_faces(
@@ -762,38 +872,137 @@ def pressure_faces_to_consistent_node_forces(
     压力先在每个目标面的积分点上由 CGNS 源面心插值得到，再按
     `F_i = -∫ N_i p n dA` 累积到该面的节点。
     """
+    plan = build_consistent_force_plan(
+        target_face_points,
+        target_node_ids,
+        source_centers,
+        k=k,
+    )
+    return apply_consistent_force_plan(plan, source_pressure)
+
+
+def build_consistent_force_plan(
+    target_face_points: list[np.ndarray],
+    target_node_ids: list[list[int]],
+    source_centers: np.ndarray,
+    k: int = 4,
+) -> ConsistentForcePlan:
+    """Build geometry-only interpolation data for consistent nodal forces."""
     if len(target_face_points) != len(target_node_ids):
         raise ValueError("target_face_points length must match target_node_ids.")
 
     integration_points: list[np.ndarray] = []
-    integration_terms: list[tuple[list[int], np.ndarray, np.ndarray]] = []
+    plan_node_ids: list[int] = []
+    node_index_by_id: dict[int, int] = {}
+    scatter_point_indices: list[int] = []
+    scatter_node_indices: list[int] = []
+    scatter_shape_values: list[float] = []
+    scatter_area_vectors: list[np.ndarray] = []
     for points, node_ids in zip(target_face_points, target_node_ids):
         point_array = np.asarray(points, dtype=float)
         if point_array.shape[0] != len(node_ids):
             raise ValueError("Each target face must have the same number of points and nodes.")
         for shape, location, area_vector_weight in _face_quadrature(point_array):
+            point_index = len(integration_points)
             integration_points.append(location)
-            integration_terms.append((node_ids, shape, area_vector_weight))
+            for local_index, node_id in enumerate(node_ids):
+                if node_id not in node_index_by_id:
+                    node_index_by_id[node_id] = len(plan_node_ids)
+                    plan_node_ids.append(node_id)
+                scatter_point_indices.append(point_index)
+                scatter_node_indices.append(node_index_by_id[node_id])
+                scatter_shape_values.append(float(shape[local_index]))
+                scatter_area_vectors.append(area_vector_weight)
 
-    pressure_at_points, distance_stats = interpolate_pressure_to_faces(
-        np.vstack(integration_points),
-        source_centers,
-        source_pressure,
-        k=k,
+    integration_point_array = np.vstack(integration_points)
+    source = np.asarray(source_centers, dtype=float)
+    indices, weights = _nearest_weights(integration_point_array, source, k)
+    nearest_distances = np.linalg.norm(source[indices[:, 0]] - integration_point_array, axis=1)
+    return ConsistentForcePlan(
+        indices=indices,
+        weights=weights,
+        distance_stats={
+            "max_nearest_distance": float(np.max(nearest_distances)),
+            "mean_nearest_distance": float(np.mean(nearest_distances)),
+        },
+        source_count=int(source.shape[0]),
+        node_ids=np.asarray(plan_node_ids, dtype=int),
+        scatter_point_indices=np.asarray(scatter_point_indices, dtype=int),
+        scatter_node_indices=np.asarray(scatter_node_indices, dtype=int),
+        scatter_shape_values=np.asarray(scatter_shape_values, dtype=float),
+        scatter_area_vectors=np.vstack(scatter_area_vectors),
     )
 
-    forces: dict[int, np.ndarray] = {}
-    for pressure, (node_ids, shape, area_vector_weight) in zip(
-        pressure_at_points,
-        integration_terms,
-    ):
-        force_weight = -pressure * area_vector_weight
-        for local_index, node_id in enumerate(node_ids):
-            contribution = shape[local_index] * force_weight
-            if node_id not in forces:
-                forces[node_id] = np.zeros(3, dtype=np.asarray(contribution).dtype)
-            forces[node_id] = forces[node_id] + contribution
-    return forces, distance_stats
+
+def _node_force_dict(node_ids: np.ndarray, node_force_array: np.ndarray) -> dict[int, np.ndarray]:
+    return {
+        int(node_id): np.asarray(node_force_array[index]).copy()
+        for index, node_id in enumerate(node_ids)
+    }
+
+
+def apply_consistent_force_plan_batch(
+    plan: ConsistentForcePlan,
+    source_pressures: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Compute consistent nodal forces for every frequency row in one pass.
+
+    The hot path is the scattered accumulation of shape-function-weighted
+    pressure contributions.  We compute component-by-component so the
+    largest temporary is ``(n_freqs, n_scatter)`` instead of
+    ``(n_freqs, n_scatter, 3)`` — a 3× peak-memory saving on the scatter
+    arrays which dominate when integration-point count is large.
+    """
+    pressures = np.asarray(source_pressures)
+    if pressures.ndim != 2:
+        raise ValueError("source_pressures must have shape (frequency_count, source_count).")
+    if pressures.shape[1] != plan.source_count:
+        raise ValueError("source_pressures second dimension must match source_centers.")
+
+    # (n_freqs, n_integration_points) — interpolate source pressure to
+    # each target-face integration point
+    pressure_at_points = np.sum(
+        pressures[:, plan.indices] * plan.weights[np.newaxis, :, :],
+        axis=2,
+    )
+
+    n_freqs = pressures.shape[0]
+    n_nodes = plan.node_ids.shape[0]
+    n_scatter = plan.scatter_point_indices.shape[0]
+
+    # Pre-broadcast the shape-value and node-index arrays so the
+    # per-component loop only does a single multiply + add.at.
+    scattered_pressure = np.empty((n_freqs, n_scatter), dtype=pressure_at_points.dtype)
+    # gather pressure at each scatter site
+    scattered_pressure[:, :] = pressure_at_points[:, plan.scatter_point_indices]
+
+    forces = np.zeros((n_freqs, n_nodes, 3), dtype=pressure_at_points.dtype)
+    rows = np.arange(n_freqs)[:, np.newaxis]
+    columns = plan.scatter_node_indices[np.newaxis, :]
+
+    for comp in range(3):
+        contrib = (
+            -scattered_pressure
+            * plan.scatter_shape_values[np.newaxis, :]
+            * plan.scatter_area_vectors[np.newaxis, :, comp]
+        )
+        np.add.at(forces[:, :, comp], (rows, columns), contrib)
+
+    return forces, plan.node_ids, plan.distance_stats
+
+
+def apply_consistent_force_plan(
+    plan: ConsistentForcePlan,
+    source_pressure: np.ndarray,
+) -> tuple[dict[int, np.ndarray], dict[str, float]]:
+    pressure = np.asarray(source_pressure)
+    if pressure.shape[0] != plan.source_count:
+        raise ValueError("source_pressure length must match source_centers.")
+    force_array, node_ids, stats = apply_consistent_force_plan_batch(
+        plan,
+        pressure[np.newaxis, :],
+    )
+    return _node_force_dict(node_ids, force_array[0]), stats
 
 
 def compute_face_force_moment(
@@ -819,6 +1028,29 @@ def compute_face_force_moment(
     return (
         np.sum(face_forces, axis=0),
         np.sum(np.cross(center_array, face_forces), axis=0),
+    )
+
+
+def _compute_face_force_moment_batch(
+    centers: np.ndarray,
+    area_vectors: np.ndarray,
+    pressures: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    center_array = np.asarray(centers, dtype=float)
+    area_array = np.asarray(area_vectors, dtype=float)
+    pressure_array = np.asarray(pressures)
+    if pressure_array.ndim != 2:
+        raise ValueError("pressures must have shape (frequency_count, source_count).")
+    if center_array.ndim != 2 or center_array.shape[1] != 3:
+        raise ValueError("centers must have shape (N, 3).")
+    if area_array.shape != center_array.shape:
+        raise ValueError("area_vectors must have the same shape as centers.")
+    if pressure_array.shape[1] != center_array.shape[0]:
+        raise ValueError("pressures second dimension must match centers.")
+    face_forces = -pressure_array[:, :, np.newaxis] * area_array[np.newaxis, :, :]
+    return (
+        np.sum(face_forces, axis=1),
+        np.sum(np.cross(center_array[np.newaxis, :, :], face_forces), axis=1),
     )
 
 
@@ -929,6 +1161,114 @@ def apply_global_conservation_correction(
     }
 
 
+def _apply_global_conservation_correction_batch(
+    node_ids: np.ndarray,
+    node_forces: np.ndarray,
+    node_coordinates: dict[int, np.ndarray],
+    desired_force: np.ndarray,
+    desired_moment: np.ndarray,
+) -> tuple[np.ndarray, list[dict[str, float]]]:
+    if node_forces.ndim != 3 or node_forces.shape[2] != 3:
+        raise ValueError("node_forces must have shape (frequency_count, node_count, 3).")
+    if node_forces.shape[1] != len(node_ids):
+        raise ValueError("node_forces node dimension must match node_ids.")
+
+    coordinates = np.vstack(
+        [np.asarray(node_coordinates[int(node_id)], dtype=float) for node_id in node_ids]
+    )
+    dtype = np.result_type(node_forces.dtype, np.asarray(desired_force).dtype, np.asarray(desired_moment).dtype)
+    forces = np.asarray(node_forces, dtype=dtype)
+    desired_force_array = np.asarray(desired_force, dtype=dtype)
+    desired_moment_array = np.asarray(desired_moment, dtype=dtype)
+
+    current_force = np.sum(forces, axis=1)
+    current_moment = np.sum(np.cross(coordinates[np.newaxis, :, :], forces), axis=1)
+    residual = np.concatenate(
+        [
+            desired_force_array - current_force,
+            desired_moment_array - current_moment,
+        ],
+        axis=1,
+    )
+
+    constraint = np.zeros((6, 3 * len(node_ids)), dtype=float)
+    for index, coordinate in enumerate(coordinates):
+        block = slice(3 * index, 3 * index + 3)
+        constraint[0:3, block] = np.eye(3)
+        constraint[3:6, block] = _cross_matrix(coordinate)
+
+    gram = constraint @ constraint.T
+    correction_matrix = constraint.T @ np.linalg.pinv(gram)
+    correction = (residual @ correction_matrix.T).reshape(forces.shape)
+    corrected = forces + correction
+
+    corrected_force = np.sum(corrected, axis=1)
+    corrected_moment = np.sum(np.cross(coordinates[np.newaxis, :, :], corrected), axis=1)
+    force_residual_before = desired_force_array - current_force
+    moment_residual_before = desired_moment_array - current_moment
+    force_residual_after = desired_force_array - corrected_force
+    moment_residual_after = desired_moment_array - corrected_moment
+    rank = int(np.linalg.matrix_rank(constraint))
+    stats = [
+        {
+            "force_residual_norm_before": float(np.linalg.norm(force_residual_before[index])),
+            "moment_residual_norm_before": float(np.linalg.norm(moment_residual_before[index])),
+            "force_residual_norm_after": float(np.linalg.norm(force_residual_after[index])),
+            "moment_residual_norm_after": float(np.linalg.norm(moment_residual_after[index])),
+            "constraint_rank": rank,
+        }
+        for index in range(forces.shape[0])
+    ]
+    return corrected, stats
+
+
+def _map_complex_pressure_batch_to_nodes(
+    target_node_ids: list[list[int]],
+    target_face_points: list[np.ndarray],
+    source_centers: np.ndarray,
+    source_area_vectors: np.ndarray,
+    source_pressures: np.ndarray,
+    *,
+    apply_conservation: bool,
+    consistent_force_plan: ConsistentForcePlan,
+) -> tuple[list[dict[int, np.ndarray]], list[dict[str, float | int]]]:
+    force_array, node_ids, distance_stats = apply_consistent_force_plan_batch(
+        consistent_force_plan,
+        source_pressures,
+    )
+    base_stats: dict[str, float | int] = {
+        "target_face_count": int(len(target_node_ids)),
+        "target_node_count": int(len(node_ids)),
+        "source_face_count": int(np.asarray(source_centers).shape[0]),
+        "integration_point_count": consistent_force_plan.integration_point_count,
+    }
+    stats = [{**base_stats, **distance_stats} for _ in range(force_array.shape[0])]
+    if apply_conservation:
+        desired_force, desired_moment = _compute_face_force_moment_batch(
+            source_centers,
+            source_area_vectors,
+            source_pressures,
+        )
+        node_coordinates = _node_coordinates_from_faces(target_node_ids, target_face_points)
+        force_array, conservation_stats = _apply_global_conservation_correction_batch(
+            node_ids,
+            force_array,
+            node_coordinates,
+            desired_force,
+            desired_moment,
+        )
+        for item, conservation in zip(stats, conservation_stats):
+            item["conservation_enabled"] = 1
+            item.update(conservation)
+    else:
+        for item in stats:
+            item["conservation_enabled"] = 0
+    return (
+        [_node_force_dict(node_ids, force_array[index]) for index in range(force_array.shape[0])],
+        stats,
+    )
+
+
 def map_complex_pressure_to_nodes(
     target_centers: np.ndarray,
     target_area_vectors: np.ndarray,
@@ -939,6 +1279,7 @@ def map_complex_pressure_to_nodes(
     target_face_points: list[np.ndarray] | None = None,
     source_area_vectors: np.ndarray | None = None,
     apply_conservation: bool = True,
+    consistent_force_plan: ConsistentForcePlan | None = None,
 ) -> tuple[dict[int, np.ndarray], dict[str, float | int]]:
     """完成频域压力到节点复数力的一步映射。
 
@@ -970,17 +1311,18 @@ def map_complex_pressure_to_nodes(
         )
         integration_point_count = int(len(target_node_ids))
     else:
-        node_forces, distance_stats = pressure_faces_to_consistent_node_forces(
-            target_face_points,
-            target_node_ids,
-            source_centers,
+        if consistent_force_plan is None:
+            consistent_force_plan = build_consistent_force_plan(
+                target_face_points,
+                target_node_ids,
+                source_centers,
+                k=k,
+            )
+        node_forces, distance_stats = apply_consistent_force_plan(
+            consistent_force_plan,
             source_pressure,
-            k=k,
         )
-        integration_point_count = sum(
-            3 if np.asarray(points).shape[0] == 3 else 4
-            for points in target_face_points
-        )
+        integration_point_count = consistent_force_plan.integration_point_count
     stats: dict[str, float | int] = {
         "target_face_count": int(len(target_node_ids)),
         "target_node_count": int(len(node_forces)),
@@ -1049,6 +1391,124 @@ def write_frequency_load_include(
             if value != 0.0:
                 lines.append(f"{node_id}, {component + 1}, {_format_float(value)}")
     include_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_frequency_table_load_include(
+    path: str | Path,
+    node_force_maps: list[dict[int, np.ndarray]],
+    frequencies_hz: list[float],
+    load_name: str = "CGNS_PRESSURE",
+    relative_zero_tolerance: float = 1.0e-12,
+) -> dict[str, int | float]:
+    """写出稳态动力学频率相关载荷 include 文件。
+
+    对每个节点/方向/实部或虚部序列，若 ``max(abs(series))`` 不超过
+    ``global_max_abs_force * relative_zero_tolerance`` 则跳过对应
+    amplitude 和 *CLOAD，以减少近零载荷噪音。
+
+    采用流式写入避免在内存中构建巨大的字符串列表；对于数千节点 ×
+    数百频率的场景，可节省数百 MB 内存峰值。
+
+    Args:
+        path: include 文件输出路径。
+        node_force_maps: 每个频率对应的节点复数力映射。
+        frequencies_hz: 与 node_force_maps 对应的频率列表。
+        load_name: 写入注释行的载荷名称。
+        relative_zero_tolerance: 相对全局最大力幅值的近零过滤阈值。
+
+    Returns:
+        输出规模统计字典，包含 frequency_count、load_table_count、
+        active_cload_count、skipped_near_zero_components、
+        global_max_abs_force 和 relative_zero_tolerance。
+    """
+    if len(node_force_maps) != len(frequencies_hz):
+        raise ValueError("node_force_maps and frequencies_hz must have matching lengths.")
+
+    n_freqs = len(frequencies_hz)
+
+    # ── 构建稠密力矩阵 (n_freqs, n_nodes, 3) ──────────────────────
+    all_node_ids = sorted(
+        {node_id for node_forces in node_force_maps for node_id in node_forces}
+    )
+    n_nodes = len(all_node_ids)
+    node_index_map = {node_id: idx for idx, node_id in enumerate(all_node_ids)}
+
+    forces_matrix = np.zeros((n_freqs, n_nodes, 3), dtype=complex)
+    for freq_idx, node_forces in enumerate(node_force_maps):
+        for node_id, force in node_forces.items():
+            forces_matrix[freq_idx, node_index_map[node_id]] = np.asarray(
+                force, dtype=complex
+            )
+
+    # ── 全局最大力幅值 ────────────────────────────────────────────
+    global_max_abs_force = (
+        float(np.max(np.abs(forces_matrix))) if forces_matrix.size > 0 else 0.0
+    )
+    threshold = global_max_abs_force * float(relative_zero_tolerance)
+
+    # ── 预格式化频率字符串，避免循环内重复转换 ─────────────────
+    freq_strings = [_format_float(float(f)) for f in frequencies_hz]
+
+    include_path = Path(path)
+    load_table_count = 0
+    active_cload_count = 0
+    skipped_near_zero = 0
+
+    with include_path.open("w", encoding="utf-8") as fh:
+        fh.write(f"** {load_name} mapped frequency-dependent loads\n")
+
+        if global_max_abs_force == 0.0:
+            fh.write("** No nonzero steady-state loads were generated.\n")
+        else:
+            for node_id in all_node_ids:
+                node_idx = node_index_map[node_id]
+                for component in range(3):
+                    real_series = np.real(forces_matrix[:, node_idx, component])
+                    imag_series = np.imag(forces_matrix[:, node_idx, component])
+
+                    real_max = float(np.max(np.abs(real_series)))
+                    imag_max = float(np.max(np.abs(imag_series)))
+
+                    if real_max > threshold:
+                        amp_name = f"CGNS_R_N{node_id}_D{component + 1}"
+                        fh.write(
+                            f"*Amplitude, name={amp_name}, definition=TABULAR\n"
+                        )
+                        for freq_str, value in zip(freq_strings, real_series):
+                            fh.write(
+                                f"{freq_str}, {_format_float(float(value))}\n"
+                            )
+                        fh.write(f"*CLOAD, REAL, amplitude={amp_name}\n")
+                        fh.write(f"{node_id}, {component + 1}, 1.\n")
+                        load_table_count += 1
+                        active_cload_count += 1
+                    else:
+                        skipped_near_zero += 1
+
+                    if imag_max > threshold:
+                        amp_name = f"CGNS_I_N{node_id}_D{component + 1}"
+                        fh.write(
+                            f"*Amplitude, name={amp_name}, definition=TABULAR\n"
+                        )
+                        for freq_str, value in zip(freq_strings, imag_series):
+                            fh.write(
+                                f"{freq_str}, {_format_float(float(value))}\n"
+                            )
+                        fh.write(f"*CLOAD, IMAGINARY, amplitude={amp_name}\n")
+                        fh.write(f"{node_id}, {component + 1}, 1.\n")
+                        load_table_count += 1
+                        active_cload_count += 1
+                    else:
+                        skipped_near_zero += 1
+
+    return {
+        "frequency_count": n_freqs,
+        "load_table_count": load_table_count,
+        "active_cload_count": active_cload_count,
+        "skipped_near_zero_components": skipped_near_zero,
+        "global_max_abs_force": global_max_abs_force,
+        "relative_zero_tolerance": float(relative_zero_tolerance),
+    }
 
 
 def estimate_time_load_records(
@@ -1184,6 +1644,80 @@ def _load_surface_geometry(extracted_dir: Path, name: str) -> tuple[np.ndarray, 
         )
 
 
+def _unique_target_nodes(target_faces: TargetFaces) -> np.ndarray:
+    """Collect unique target-node coordinates in face traversal order."""
+    seen: set[int] = set()
+    points: list[np.ndarray] = []
+    for node_ids, face_points in zip(target_faces.node_ids, target_faces.face_points):
+        for node_id, point in zip(node_ids, face_points):
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            points.append(np.asarray(point, dtype=float))
+    if not points:
+        raise ValueError("Target faces did not contain any nodes.")
+    return np.vstack(points)
+
+
+def build_alignment_preview(
+    inp_path: str | Path,
+    extracted_dir: str | Path,
+    target_set: str,
+    target_set_type: Literal["nset", "elset"],
+    scale: float = 1.0,
+    translate: np.ndarray | None = None,
+    axis_order: tuple[int, int, int] = (0, 1, 2),
+    axis_sign: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    surface_geometry_name: str = "surface_geometry.npz",
+    distance_sample_limit: int = 3000,
+) -> AlignmentPreview:
+    """Prepare non-mutating CGNS/INP coordinates for GUI alignment preview."""
+    model = parse_inp_file(inp_path)
+    target_faces = select_target_faces(model, target_set, target_set_type)
+    source_centers, _source_area_vectors = _load_surface_geometry(
+        Path(extracted_dir),
+        surface_geometry_name,
+    )
+    transformed_source_centers = apply_coordinate_transform(
+        source_centers,
+        scale=scale,
+        translate=translate,
+        axis_order=axis_order,
+        axis_sign=axis_sign,
+    )
+    target_nodes = _unique_target_nodes(target_faces)
+    distance_sources = _sample_rows_evenly(transformed_source_centers, distance_sample_limit)
+    distance_targets = _sample_rows_evenly(target_faces.centers, distance_sample_limit)
+    nearest_distances = _nearest_distances(distance_sources, distance_targets)
+    bounds_min = np.minimum.reduce(
+        [
+            np.min(transformed_source_centers, axis=0),
+            np.min(target_faces.centers, axis=0),
+            np.min(target_nodes, axis=0),
+        ],
+    )
+    bounds_max = np.maximum.reduce(
+        [
+            np.max(transformed_source_centers, axis=0),
+            np.max(target_faces.centers, axis=0),
+            np.max(target_nodes, axis=0),
+        ],
+    )
+    return AlignmentPreview(
+        source_centers=transformed_source_centers,
+        target_centers=target_faces.centers,
+        target_nodes=target_nodes,
+        source_count=int(transformed_source_centers.shape[0]),
+        target_face_count=int(target_faces.centers.shape[0]),
+        target_node_count=int(target_nodes.shape[0]),
+        bounds_min=bounds_min,
+        bounds_max=bounds_max,
+        nearest_distance_min=float(np.min(nearest_distances)),
+        nearest_distance_mean=float(np.mean(nearest_distances)),
+        nearest_distance_max=float(np.max(nearest_distances)),
+    )
+
+
 def _load_complex_spectrum(
     extracted_dir: Path,
     name: str,
@@ -1279,6 +1813,38 @@ def _mapping_assumptions() -> dict[str, str]:
     }
 
 
+def _auto_batch_size(
+    n_frequencies: int,
+    n_sources: int,
+    n_scatter: int,
+    *,
+    memory_limit_mb: float = 512.0,
+    min_batch: int = 1,
+) -> int:
+    """Choose a frequency batch size that keeps peak memory under *memory_limit_mb*.
+
+    The dominant arrays during a batch are:
+
+    * ``pressures``: ``(batch, n_sources)`` complex128
+    * ``pressure_at_points``: ``(batch, n_integration_points)`` float64
+    * ``scattered_pressure``: ``(batch, n_scatter)`` float64
+    * ``forces``: ``(batch, n_nodes, 3)`` float64
+    """
+    bytes_per_complex = 16
+    bytes_per_float = 8
+    # Rough estimate of per-frequency bytes from the main intermediate arrays
+    per_freq_bytes = (
+        n_sources * bytes_per_complex
+        + n_scatter * bytes_per_float * 3  # pressure_at_points + scattered + contrib
+        + n_scatter * bytes_per_float      # shape_values / area_vectors broadcast
+    )
+    if per_freq_bytes <= 0:
+        per_freq_bytes = 1
+    limit_bytes = memory_limit_mb * 1024 * 1024
+    batch = max(min_batch, min(n_frequencies, int(limit_bytes / per_freq_bytes)))
+    return batch
+
+
 def _default_output_path(inp_path: Path) -> Path:
     """根据原始 INP 路径生成默认输出路径。"""
     return inp_path.with_name(f"{inp_path.stem}_mapped{inp_path.suffix}")
@@ -1288,12 +1854,6 @@ def _frequency_suffix(frequency_hz: float) -> str:
     """将频率值转换为可用于文件名的后缀。"""
     text = f"{float(frequency_hz):g}".replace("-", "m").replace(".", "p")
     return f"{text}Hz"
-
-
-def _frequency_output_path(base_output: Path, frequency_hz: float) -> Path:
-    """为多频率稳态映射生成单频率输出 INP 路径。"""
-    suffix = _frequency_suffix(frequency_hz)
-    return base_output.with_name(f"{base_output.stem}_{suffix}{base_output.suffix}")
 
 
 def _load_model_step(model: AbaqusModel, requested_step: str | None) -> AbaqusStep:
@@ -1340,12 +1900,16 @@ def run_mapping(
     pressure_time_name: str = "pressure_time.json.gz",
     report_name: str = "mapping_report.json",
     conserve_global_loads: bool = True,
+    frequency_batch_size: int | None = None,
+    relative_zero_tolerance: float = 1.0e-12,
+    show_progress: bool = True,
+    num_workers: int = 1,
 ) -> MappingResult:
     """执行完整压力映射流程并写出新 INP。
 
-    稳态动力学按指定频率读取复数压力谱；若给出多个频率，则每个
-    频率生成一个独立 INP 和 include。瞬态/显式动力学读取时域压力，
-    并在写 include 前检查展开规模。
+    稳态动力学按指定频率读取复数压力谱；多个频率共享同一个分析步和
+    include 文件。瞬态/显式动力学读取时域压力，并在写 include 前检查
+    展开规模。
 
     Args:
         inp_path: 原始 Abaqus INP 文件路径。
@@ -1353,7 +1917,7 @@ def run_mapping(
         target_set: 受载 Nset 或 Elset 名称。
         target_set_type: 目标集合类型。
         frequencies: 稳态动力学目标频率列表。
-        output_path: 输出 INP 基础路径；为 None 时自动加 `_mapped`。
+        output_path: 输出 INP 基础路径；为 None 时自动加 ``_mapped``。
         step_name: 指定接收载荷的分析步名称；为 None 时使用首个 step。
         frequency_tolerance_hz: 频率匹配容差。
         k: 反距离插值使用的最近邻数量。
@@ -1367,6 +1931,13 @@ def run_mapping(
         pressure_time_name: 时域压力 gzip JSON 文件名。
         report_name: 映射报告文件名。
         conserve_global_loads: 是否修正节点力以守恒源 CGNS 总力和总力矩。
+        frequency_batch_size: 频率分块大小；为 None 时根据内存自动计算。
+        relative_zero_tolerance: 相对全局最大力幅值的近零过滤阈值。
+        show_progress: 是否在控制台输出进度信息；默认开启。
+        num_workers: 并行处理频率批次的线程数；默认 1（串行）。
+            设为 0 则使用 ``min(32, os.cpu_count() + 4)``。
+            多线程通过 ``ThreadPoolExecutor`` 实现，利用 NumPy
+            在多数运算中释放 GIL 的特性。
 
     Returns:
         输出 INP、include 和报告路径。
@@ -1422,64 +1993,184 @@ def run_mapping(
     if step.kind == "steady_state":
         if not frequencies:
             raise ValueError("At least one --frequency is required for steady-state mapping.")
+
+        if show_progress:
+            print("加载复数压力谱…")
         extracted_frequencies, pressure_spectrum = _load_complex_spectrum(
             extracted,
             complex_spectrum_name,
         )
-        per_frequency_stats: list[dict[str, Any]] = []
-        mapped_frequencies: list[float] = []
-        for requested_frequency in frequencies:
-            output_for_frequency = (
-                output
-                if len(frequencies) == 1
-                else _frequency_output_path(output, float(requested_frequency))
-            )
-            include_path = output_for_frequency.with_name(
-                f"{output_for_frequency.stem}_loads.inc"
-            )
-            spectrum_index = find_frequency_index(
+
+        if show_progress:
+            print(f"  源面数量: {pressure_spectrum.shape[1]}, "
+                  f"提取频率数: {len(extracted_frequencies)}")
+            print("构建一致力积分方案…")
+        consistent_force_plan = build_consistent_force_plan(
+            target_faces.face_points,
+            target_faces.node_ids,
+            transformed_source_centers,
+            k=k,
+        )
+        if show_progress:
+            print(f"  积分点数: {consistent_force_plan.integration_point_count}, "
+                  f"受载节点数: {len(consistent_force_plan.node_ids)}")
+
+        spectrum_indices = [
+            find_frequency_index(
                 extracted_frequencies,
                 float(requested_frequency),
                 tolerance_hz=frequency_tolerance_hz,
             )
-            node_forces, stats = map_complex_pressure_to_nodes(
-                target_faces.centers,
-                target_faces.area_vectors,
+            for requested_frequency in frequencies
+        ]
+
+        # ── 频率分块 ────────────────────────────────────
+        if frequency_batch_size is not None and frequency_batch_size > 0:
+            batch_size = int(frequency_batch_size)
+        else:
+            batch_size = _auto_batch_size(
+                len(spectrum_indices),
+                n_sources=pressure_spectrum.shape[1],
+                n_scatter=consistent_force_plan.indices.shape[0] * 4,
+                memory_limit_mb=512.0,
+            )
+        batch_count = max(1, (len(spectrum_indices) + batch_size - 1) // batch_size)
+
+        # ── 解析并行度 ─────────────────────────────────
+        workers = int(num_workers)
+        if workers == 0:
+            workers = min(32, (getattr(os, "cpu_count", lambda: 4)() or 4) + 4)
+        use_parallel = workers > 1 and batch_count > 1
+
+        if show_progress and batch_count > 1:
+            if use_parallel:
+                print(f"  频率分块: 每块 {batch_size} 个频率, 共 {batch_count} 块 "
+                      f"(共 {len(spectrum_indices)} 个频率, {workers} 线程并行)")
+            else:
+                print(f"  频率分块: 每块 {batch_size} 个频率, 共 {batch_count} 块 "
+                      f"(共 {len(spectrum_indices)} 个频率)")
+
+        # 预计算所有批次的切片
+        batch_specs: list[tuple[int, np.ndarray]] = []
+        for batch_start in range(0, len(spectrum_indices), batch_size):
+            batch_end = min(batch_start + batch_size, len(spectrum_indices))
+            batch_specs.append(
+                (batch_start, np.asarray(spectrum_indices[batch_start:batch_end], dtype=int))
+            )
+
+        # 单个批次的工作函数（闭包捕获只读共享数据，线程安全）
+        def _process_batch(spec: tuple[int, np.ndarray]) -> tuple[
+            list[dict[int, np.ndarray]],
+            list[dict[str, float | int]],
+        ]:
+            _batch_start, batch_slice = spec
+            batch_pressures = pressure_spectrum[batch_slice]
+            return _map_complex_pressure_batch_to_nodes(
                 target_faces.node_ids,
+                target_faces.face_points,
                 transformed_source_centers,
-                pressure_spectrum[spectrum_index],
-                k=k,
-                target_face_points=target_faces.face_points,
-                source_area_vectors=transformed_source_area_vectors,
+                transformed_source_area_vectors,
+                batch_pressures,
                 apply_conservation=conserve_global_loads,
+                consistent_force_plan=consistent_force_plan,
             )
-            write_frequency_load_include(
-                include_path,
-                node_forces,
-                frequency_hz=float(extracted_frequencies[spectrum_index]),
-            )
-            include_paths.append(include_path)
-            output_paths.append(output_for_frequency)
-            mapped_frequencies.append(float(extracted_frequencies[spectrum_index]))
+
+        all_force_maps: list[dict[int, np.ndarray]] = []
+        all_batch_stats: list[dict[str, float | int]] = []
+
+        if use_parallel:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                # 按顺序提交，future 列表索引即批次顺序
+                futures = [
+                    executor.submit(_process_batch, spec) for spec in batch_specs
+                ]
+                for idx, future in enumerate(futures):
+                    # 按提交顺序等待结果，保证频率顺序不变
+                    batch_force_maps, batch_chunk_stats = future.result()
+                    all_force_maps.extend(batch_force_maps)
+                    all_batch_stats.extend(batch_chunk_stats)
+                    if show_progress:
+                        print(f"  频率块 {idx + 1}/{batch_count} 完成")
+        else:
+            for batch_idx, spec in enumerate(batch_specs):
+                if show_progress and batch_count > 1:
+                    print(f"  处理频率块 {batch_idx + 1}/{batch_count} "
+                          f"({len(spec[1])} 个频率)...")
+                batch_force_maps, batch_chunk_stats = _process_batch(spec)
+                if show_progress and batch_count > 1:
+                    print("    完成")
+                all_force_maps.extend(batch_force_maps)
+                all_batch_stats.extend(batch_chunk_stats)
+
+        node_force_maps = all_force_maps
+        batch_stats = all_batch_stats
+
+        per_frequency_stats: list[dict[str, Any]] = []
+        mapped_frequencies: list[float] = []
+        for requested_frequency, spectrum_index, node_forces, stats in zip(
+            frequencies,
+            spectrum_indices,
+            node_force_maps,
+            batch_stats,
+        ):
+            mapped_frequency = float(extracted_frequencies[spectrum_index])
+            mapped_frequencies.append(mapped_frequency)
             per_frequency_stats.append(
                 {
                     "requested_frequency_hz": float(requested_frequency),
-                    "mapped_frequency_hz": float(extracted_frequencies[spectrum_index]),
+                    "mapped_frequency_hz": mapped_frequency,
                     **stats,
                 }
             )
+        include_path = output.with_name(f"{output.stem}_loads.inc")
+        if show_progress:
+            n_nodes = len(set(nid for nf in node_force_maps for nid in nf))
+            print(f"写出载荷 include ({len(node_force_maps)} 个频率, "
+                  f"{n_nodes} 个受载节点)...")
+        if len(node_force_maps) == 1:
+            write_frequency_load_include(
+                include_path,
+                node_force_maps[0],
+                frequency_hz=mapped_frequencies[0],
+            )
+            frequency_table_stats: dict[str, int | float] = {
+                "frequency_count": 1,
+                "load_table_count": 0,
+                "active_cload_count": 0,
+                "skipped_near_zero_components": 0,
+                "global_max_abs_force": 0.0,
+                "relative_zero_tolerance": float(relative_zero_tolerance),
+            }
+        else:
+            frequency_table_stats = write_frequency_table_load_include(
+                include_path,
+                node_force_maps,
+                mapped_frequencies,
+                relative_zero_tolerance=relative_zero_tolerance,
+            )
+        include_paths.append(include_path)
+        output_paths.append(output)
         report.update(
             {
                 "frequencies_hz": mapped_frequencies,
                 "mapping_stats": per_frequency_stats[0]
                 if len(per_frequency_stats) == 1
                 else per_frequency_stats,
+                "frequency_table_output": frequency_table_stats,
+                "include_file_count": len(include_paths),
+                "output_inp_count": len(output_paths),
                 "output_inps": [str(path) for path in output_paths],
                 "include_files": [str(path) for path in include_paths],
             }
         )
     elif step.kind in {"dynamic", "dynamic_explicit"}:
         times, pressure_time = _load_time_pressure(extracted, pressure_time_name)
+        consistent_force_plan = build_consistent_force_plan(
+            target_faces.face_points,
+            target_faces.node_ids,
+            transformed_source_centers,
+            k=k,
+        )
         node_series: dict[int, np.ndarray] = {}
         last_stats: dict[str, float | int] = {}
         for time_index in range(pressure_time.shape[0]):
@@ -1493,6 +2184,7 @@ def run_mapping(
                 target_face_points=target_faces.face_points,
                 source_area_vectors=transformed_source_area_vectors,
                 apply_conservation=conserve_global_loads,
+                consistent_force_plan=consistent_force_plan,
             )
             for node_id, force in node_forces.items():
                 if node_id not in node_series:
@@ -1511,6 +2203,8 @@ def run_mapping(
             {
                 "time_sample_count": int(len(times)),
                 "mapping_stats": last_stats,
+                "include_file_count": len(include_paths),
+                "output_inp_count": len(output_paths),
                 "output_inps": [str(output)],
                 "include_files": [str(include_path)],
             }
@@ -1520,11 +2214,20 @@ def run_mapping(
             "Only *STEADY STATE DYNAMICS and *DYNAMIC steps are supported for mapping."
         )
 
+    if show_progress:
+        print("写出新 INP 文件…")
     for output_file, include_file in zip(output_paths, include_paths):
         new_lines = insert_include_before_step_end(model.lines, step, include_file)
         output_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     report_path = output.with_name(report_name)
     _write_mapping_report(report_path, report)
+    if show_progress:
+        for output_file in output_paths:
+            print(f"  {output_file}")
+        for include_file in include_paths:
+            print(f"  {include_file}")
+        print(f"  {report_path}")
+        print("映射完成。")
     return MappingResult(
         output_inp_path=output_paths[0],
         output_inp_paths=output_paths,
@@ -1583,6 +2286,33 @@ def parse_frequency_text(text: str) -> list[float] | None:
         else:
             frequencies.append(float(value))
     return frequencies or None
+
+
+def _parse_gui_triplet(text: str, *, cast: Any) -> tuple[Any, Any, Any]:
+    try:
+        return _parse_triplet(text, cast=cast)
+    except (argparse.ArgumentTypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def parse_gui_translate(text: str) -> np.ndarray | None:
+    """Parse optional GUI translation text; blank means no translation."""
+    if not text.strip():
+        return None
+    return np.array(_parse_gui_triplet(text, cast=float), dtype=float)
+
+
+def parse_gui_axis_order(text: str) -> tuple[int, int, int]:
+    """Parse GUI axis order text."""
+    axis_order = _parse_gui_triplet(text, cast=int)
+    if sorted(axis_order) != [0, 1, 2]:
+        raise ValueError("axis_order must be a permutation of 0, 1, 2.")
+    return axis_order  # type: ignore[return-value]
+
+
+def parse_gui_axis_sign(text: str) -> tuple[float, float, float]:
+    """Parse GUI axis sign text."""
+    return _parse_gui_triplet(text, cast=float)  # type: ignore[return-value]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1654,6 +2384,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=500000,
         help="Safety limit for expanded time-domain load records.",
     )
+    parser.add_argument(
+        "--frequency-batch-size",
+        type=int,
+        default=None,
+        help="Number of frequencies to process per batch; default processes all at once.",
+    )
+    parser.add_argument(
+        "--relative-zero-tolerance",
+        type=float,
+        default=1.0e-12,
+        help="Relative threshold (× global max force) below which components are skipped.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of threads for parallel frequency-batch processing; default 1 (serial). 0 = auto.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1683,6 +2431,9 @@ def run_cli(argv: list[str] | None = None) -> int:
             axis_order=args.axis_order,
             axis_sign=args.axis_sign,
             max_time_records=args.max_time_records,
+            frequency_batch_size=args.frequency_batch_size,
+            relative_zero_tolerance=args.relative_zero_tolerance,
+            num_workers=args.num_workers,
         )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -1696,117 +2447,10 @@ def run_cli(argv: list[str] | None = None) -> int:
 
 
 def run_gui() -> int:
-    """启动基于文件选择器的 Tkinter 映射界面。
+    """启动基于文件选择器的 Tkinter 映射界面。"""
+    from starccm_pressure.mapping_gui import run_gui as _run_gui
 
-    Returns:
-        进程退出码；GUI 正常关闭返回 0。
-    """
-    try:
-        import tkinter as tk
-        from tkinter import filedialog, messagebox, ttk
-    except Exception as exc:
-        print(f"Error: Tkinter is required for GUI mode: {exc}", file=sys.stderr)
-        return 1
-
-    root = tk.Tk()
-    root.title("CGNS Pressure to INP Mapper")
-    root.geometry("780x450")
-    root.resizable(False, False)
-
-    inp_var = tk.StringVar(value="")
-    extracted_var = tk.StringVar(value="cgns_pressure_output")
-    output_var = tk.StringVar(value="")
-    target_set_var = tk.StringVar(value="")
-    target_type_var = tk.StringVar(value="elset")
-    frequency_var = tk.StringVar(value="1:800:1")
-    status_var = tk.StringVar(value="Ready")
-
-    frame = ttk.Frame(root, padding=16)
-    frame.grid(row=0, column=0, sticky="nsew")
-    frame.columnconfigure(1, weight=1)
-
-    def browse_inp() -> None:
-        path = filedialog.askopenfilename(
-            title="Select Abaqus INP",
-            filetypes=[("Abaqus INP", "*.inp"), ("All files", "*.*")],
-        )
-        if path:
-            inp_var.set(path)
-            if not output_var.get().strip():
-                input_path = Path(path)
-                output_var.set(str(_default_output_path(input_path)))
-
-    def browse_extracted() -> None:
-        path = filedialog.askdirectory(title="Select extracted CGNS output directory")
-        if path:
-            extracted_var.set(path)
-
-    def browse_output() -> None:
-        path = filedialog.asksaveasfilename(
-            title="Save mapped INP",
-            defaultextension=".inp",
-            filetypes=[("Abaqus INP", "*.inp"), ("All files", "*.*")],
-        )
-        if path:
-            output_var.set(path)
-
-    def run_job() -> None:
-        try:
-            frequencies = parse_frequency_text(frequency_var.get())
-            result = run_mapping(
-                inp_path=inp_var.get().strip(),
-                extracted_dir=extracted_var.get().strip(),
-                target_set=target_set_var.get().strip(),
-                target_set_type=target_type_var.get().strip(),  # type: ignore[arg-type]
-                frequencies=frequencies,
-                output_path=output_var.get().strip() or None,
-            )
-        except Exception as exc:
-            status_var.set(f"Error: {exc}")
-            messagebox.showerror("Mapping failed", str(exc))
-            return
-        status_var.set(f"Wrote {result.output_inp_path}")
-        messagebox.showinfo("Done", f"Wrote:\n{result.output_inp_path}")
-
-    ttk.Label(frame, text="INP file").grid(row=0, column=0, sticky="w", pady=6)
-    ttk.Entry(frame, textvariable=inp_var, width=72).grid(row=0, column=1, sticky="ew", pady=6)
-    ttk.Button(frame, text="Browse", command=browse_inp).grid(row=0, column=2, padx=(8, 0))
-
-    ttk.Label(frame, text="Extracted dir").grid(row=1, column=0, sticky="w", pady=6)
-    ttk.Entry(frame, textvariable=extracted_var, width=72).grid(row=1, column=1, sticky="ew", pady=6)
-    ttk.Button(frame, text="Browse", command=browse_extracted).grid(row=1, column=2, padx=(8, 0))
-
-    ttk.Label(frame, text="Output INP").grid(row=2, column=0, sticky="w", pady=6)
-    ttk.Entry(frame, textvariable=output_var, width=72).grid(row=2, column=1, sticky="ew", pady=6)
-    ttk.Button(frame, text="Browse", command=browse_output).grid(row=2, column=2, padx=(8, 0))
-
-    ttk.Label(frame, text="Target set").grid(row=3, column=0, sticky="w", pady=6)
-    ttk.Entry(frame, textvariable=target_set_var, width=24).grid(row=3, column=1, sticky="w", pady=6)
-
-    ttk.Label(frame, text="Set type").grid(row=4, column=0, sticky="w", pady=6)
-    ttk.Combobox(
-        frame,
-        textvariable=target_type_var,
-        values=("elset", "nset"),
-        state="readonly",
-        width=12,
-    ).grid(row=4, column=1, sticky="w", pady=6)
-
-    ttk.Label(frame, text="Frequency Hz or range").grid(row=5, column=0, sticky="w", pady=6)
-    ttk.Entry(frame, textvariable=frequency_var, width=32).grid(row=5, column=1, sticky="w", pady=6)
-
-    ttk.Button(frame, text="Run mapping", command=run_job).grid(row=6, column=1, sticky="w", pady=(16, 8))
-    ttk.Label(frame, textvariable=status_var, wraplength=680).grid(
-        row=7,
-        column=0,
-        columnspan=3,
-        sticky="w",
-        pady=(12, 0),
-    )
-
-    root.mainloop()
-    return 0
-
+    return _run_gui()
 
 def main(argv: list[str] | None = None) -> int:
     """根据是否传入参数选择 GUI 或 CLI 入口。
@@ -1826,3 +2470,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

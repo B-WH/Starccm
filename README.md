@@ -49,7 +49,19 @@ python extract_cgns_pressure.py "other_files\data\604@*.cgns" `
 python map_cgns_pressure_to_inp.py
 ```
 
-频域映射命令行示例：
+映射前建议先点击图形界面中的 `预览坐标对齐`，用三视图检查 CGNS 表面
+和 INP 目标受载区域是否重合。预览窗口中蓝色点为变换后的 CGNS 面心，
+橙色点为 INP 目标节点，黑色十字为 INP 目标面心；窗口顶部会显示点数、
+边界范围和 CGNS 到 INP 目标面心的最近距离统计。
+
+预览和正式映射共用同一组坐标变换参数：
+
+- `比例系数`：CGNS 到 INP 坐标的比例系数。
+- `平移 dx,dy,dz`：平移量，格式为 `dx,dy,dz`；留空表示不平移。
+- `轴顺序`：轴顺序，格式如 `0,1,2` 或 `2,0,1`。
+- `轴方向`：轴方向符号，格式如 `1,1,1` 或 `1,-1,1`。
+
+频域映射命令行示例（4 线程并行）：
 
 ```powershell
 python map_cgns_pressure_to_inp.py `
@@ -58,7 +70,8 @@ python map_cgns_pressure_to_inp.py `
   --target-set SURFACE `
   --target-set-type elset `
   --frequency 100 `
-  --output model_mapped.inp
+  --output model_mapped.inp `
+  --num-workers 4
 ```
 
 若要映射连续频率范围，例如 `dt=0.0005 s`、2000 个时间步对应的 1 Hz 频率分辨率，
@@ -71,7 +84,8 @@ python map_cgns_pressure_to_inp.py `
   --target-set SURFACE `
   --target-set-type elset `
   --frequency-range 1:800:1 `
-  --output model_mapped.inp
+  --output model_mapped.inp `
+  --num-workers 4
 ```
 
 对于 `*STEADY STATE DYNAMICS` 稳态动力学分析步，映射程序使用：
@@ -89,7 +103,7 @@ python map_cgns_pressure_to_inp.py `
 
 映射程序在目标面的积分点上使用源面心反距离权重插值，并通过形函数积分
 生成一致等效节点力；随后用最小范数修正保证目标节点载荷与源 CGNS
-压力载荷的全局总力和总力矩一致。安装 `scipy` 后会自动使用
+压力载荷的全局总力和总力矩一致。安装可选加速依赖 `scipy` 后会自动使用
 `scipy.spatial.cKDTree` 加速最近邻查询；如果当前环境没有 `scipy`，程序会回退到
 NumPy 全量距离扫描。
 
@@ -100,6 +114,17 @@ NumPy 全量距离扫描。
 - 全局总力和总力矩通过最小范数节点力修正保持守恒，并记录修正前后残差。
 - 当前适用范围是线性壳/面单元，以及一阶 `C3D4`/`C3D8` 实体外表面。
 
+### 性能优化参数
+
+**`--num-workers N`**（默认 1）：多线程并行处理频率批次。设为 0 自动选择
+线程数。多频率场景（如 `--frequency-range 1:800:1`）提升最明显——
+4 线程通常能获得 3-4× 加速。该参数使用 `ThreadPoolExecutor`，无需额外依赖，
+打包为 exe 后同样可用。
+
+**`--frequency-batch-size N`**（默认自动）：每个频率批次处理的频率数量。
+减小可降低内存峰值（大模型场景），增大可减少批次调度开销。默认为 `None`
+时程序根据内存自动计算安全分块大小。通常不需要手动设置。
+
 ## 安装依赖
 
 建议使用 Python 3.11+，或使用项目本地虚拟环境。安装依赖：
@@ -108,8 +133,14 @@ NumPy 全量距离扫描。
 pip install -r requirements.txt
 ```
 
+如果希望在大模型最近邻查询中使用 SciPy 加速，可额外安装：
+
+```powershell
+pip install .[speed]
+```
+
 `tkinter`、`argparse`、`gzip` 和 `json` 属于 Python 标准库，不写入
-`requirements.txt`。
+`requirements.txt`。`scipy` 是可选加速依赖，不影响基本功能。
 
 ## 打包 EXE
 
@@ -117,6 +148,7 @@ Windows 下可使用 PyInstaller 打包两个命令行工具：
 
 ```powershell
 pip install -r requirements.txt
+pip install .[speed]
 pip install pyinstaller
 .\packaging\build_exe.ps1
 ```
@@ -124,11 +156,11 @@ pip install pyinstaller
 输出文件位于 `dist/`：
 
 - `extract_cgns_pressure_cli.exe`：命令行提取工具，适合批处理。
-- `extract_cgns_pressure_gui.exe`：双击打开提取 GUI。
+- `extract_cgns_pressure_gui.exe`：双击打开提取图形界面。
 - `map_cgns_pressure_to_inp_cli.exe`：命令行映射工具，适合批处理。
-- `map_cgns_pressure_to_inp_gui.exe`：双击打开映射 GUI。
+- `map_cgns_pressure_to_inp_gui.exe`：双击打开映射图形界面。
 
-映射 GUI 的频率输入框支持单个频率、逗号分隔频率和范围，例如 `1:800:1`。
+映射图形界面的频率输入框支持单个频率、逗号分隔频率和范围，例如 `1:800:1`。
 
 ## 测试
 

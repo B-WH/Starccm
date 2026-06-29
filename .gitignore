@@ -38,6 +38,7 @@ mapping_report.json
 build/
 dist/
 *.spec
+*.egg-info/
 
 # Local agent/tool metadata
 .agents/

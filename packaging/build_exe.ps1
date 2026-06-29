@@ -9,12 +9,17 @@ Set-Location $root
 
 if ($Clean) {
     if (Test-Path -LiteralPath "build") {
-        Write-Host "Clean requested. Delete the build directory manually if needed."
-        exit 1
+        Write-Host "Removing build directory..."
+        Remove-Item -LiteralPath "build" -Recurse -Force
     }
     if (Test-Path -LiteralPath "dist") {
-        Write-Host "Clean requested. Delete the dist directory manually if needed."
-        exit 1
+        Write-Host "Removing dist directory..."
+        Remove-Item -LiteralPath "dist" -Recurse -Force
+    }
+    $specFiles = Get-ChildItem -Path . -Filter "*.spec" -ErrorAction SilentlyContinue
+    foreach ($spec in $specFiles) {
+        Write-Host "Removing $($spec.Name)..."
+        Remove-Item -LiteralPath $spec.FullName -Force
     }
 }
 
