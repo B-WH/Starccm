@@ -337,7 +337,13 @@ def run_gui() -> int:
         sticky="ew",
         pady=(8, 0),
     )
-    ttk.Label(frame, textvariable=progress_text_var, wraplength=700).grid(
+    ttk.Label(
+        frame,
+        textvariable=progress_text_var,
+        width=82,
+        anchor="w",
+        wraplength=700,
+    ).grid(
         row=13,
         column=0,
         columnspan=3,

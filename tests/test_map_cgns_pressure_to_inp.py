@@ -15,6 +15,7 @@ from map_cgns_pressure_to_inp import (
     build_alignment_preview,
     compute_node_force_moment,
     estimate_time_load_records,
+    ensure_preprint_echo_off,
     find_frequency_index,
     map_complex_pressure_to_nodes,
     parse_args,
@@ -405,6 +406,26 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         self.assertIn("2, 1, 10", text)
         self.assertIn("2, 3, -20", text)
 
+    def test_preprint_echo_is_forced_off_before_step(self) -> None:
+        lines = [
+            "*Heading",
+            "*Preprint, echo=YES, model=YES, history=YES",
+            "*Node",
+            "1, 0, 0, 0",
+            "*Step",
+            "*Steady State Dynamics",
+            "*End Step",
+        ]
+
+        updated = ensure_preprint_echo_off(lines)
+
+        self.assertIn("*Preprint, echo=NO, model=NO, history=NO", updated)
+        self.assertNotIn("*Preprint, echo=YES, model=YES, history=YES", updated)
+        self.assertLess(
+            updated.index("*Preprint, echo=NO, model=NO, history=NO"),
+            updated.index("*Step"),
+        )
+
     def test_run_mapping_generates_mapped_inp_include_and_report(self) -> None:
         inp_path = Path("map_test_model.inp")
         output_path = Path("map_test_model_mapped.inp")
@@ -456,9 +477,11 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
 
         self.assertEqual(result.output_inp_path, output_path)
         self.assertTrue(Path("map_test_model_mapped_loads.inc").exists())
+        mapped_text = output_path.read_text(encoding="utf-8")
+        self.assertIn("*Preprint, echo=NO, model=NO, history=NO", mapped_text)
         self.assertIn(
             "*INCLUDE, INPUT=map_test_model_mapped_loads.inc",
-            output_path.read_text(encoding="utf-8"),
+            mapped_text,
         )
         report = json.loads(Path("mapping_report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["step_kind"], "steady_state")

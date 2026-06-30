@@ -33,6 +33,7 @@ from starccm_pressure.optional_deps import load_ckdtree
 
 StepKind = Literal["steady_state", "dynamic_explicit", "dynamic", "unknown"]
 ProgressCallback = Callable[[dict[str, Any]], None]
+PREPRINT_NO_ECHO_LINE = "*Preprint, echo=NO, model=NO, history=NO"
 
 
 def _report_mapping_progress(
@@ -2062,6 +2063,22 @@ def insert_include_before_step_end(
     return lines[: step.end_line] + [include_line] + lines[step.end_line :]
 
 
+def ensure_preprint_echo_off(lines: list[str]) -> list[str]:
+    """Disable Abaqus input echo so large load includes do not bloat .dat files."""
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("**"):
+            continue
+        keyword = _keyword_name(stripped)
+        if keyword == "*preprint":
+            updated = list(lines)
+            updated[index] = PREPRINT_NO_ECHO_LINE
+            return updated
+        if keyword == "*step":
+            return lines[:index] + [PREPRINT_NO_ECHO_LINE] + lines[index:]
+    return [PREPRINT_NO_ECHO_LINE] + list(lines)
+
+
 def _write_mapping_report(
     report_path: Path,
     payload: dict[str, Any],
@@ -2320,13 +2337,13 @@ def run_mapping(
             progress_callback,
             1,
             progress_total,
-            "已加载 INP、几何和压力谱。",
+            "数据已加载",
         )
         _report_mapping_progress(
             progress_callback,
             2,
             progress_total,
-            "已构建一致力积分方案。",
+            "积分方案已构建",
         )
 
         # ── 解析并行度 ─────────────────────────────────
@@ -2388,7 +2405,7 @@ def run_mapping(
                         progress_callback,
                         idx + 3,
                         progress_total,
-                        f"频率块 {idx + 1}/{batch_count} 完成。",
+                        f"频率块 {idx + 1}/{batch_count}",
                     )
                     if show_progress:
                         print(f"  频率块 {idx + 1}/{batch_count} 完成")
@@ -2406,7 +2423,7 @@ def run_mapping(
                     progress_callback,
                     batch_idx + 3,
                     progress_total,
-                    f"频率块 {batch_idx + 1}/{batch_count} 完成。",
+                    f"频率块 {batch_idx + 1}/{batch_count}",
                 )
 
         node_force_maps = all_force_maps
@@ -2464,7 +2481,7 @@ def run_mapping(
             progress_callback,
             progress_total - 1,
             progress_total,
-            "已写出载荷 include。",
+            "载荷文件已写出",
         )
         report.update(
             {
@@ -2492,7 +2509,7 @@ def run_mapping(
             progress_callback,
             1,
             progress_total,
-            "已加载 INP、几何和时域压力。",
+            "数据已加载",
         )
         node_series: dict[int, np.ndarray] = {}
         last_stats: dict[str, float | int] = {}
@@ -2517,7 +2534,7 @@ def run_mapping(
                 progress_callback,
                 time_index + 2,
                 progress_total,
-                f"时间步 {time_index + 1}/{pressure_time.shape[0]} 完成。",
+                f"时间步 {time_index + 1}/{pressure_time.shape[0]}",
             )
         include_path = output.with_name(f"{output.stem}_loads.inc")
         write_time_load_include(
@@ -2533,7 +2550,7 @@ def run_mapping(
             progress_callback,
             progress_total - 1,
             progress_total,
-            "已写出载荷 include。",
+            "载荷文件已写出",
         )
         report.update(
             {
@@ -2554,6 +2571,7 @@ def run_mapping(
         print("写出新 INP 文件…")
     for output_file, include_file in zip(output_paths, include_paths):
         new_lines = insert_include_before_step_end(model.lines, step, include_file)
+        new_lines = ensure_preprint_echo_off(new_lines)
         output_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     report_path = output.with_name(report_name)
     _write_mapping_report(report_path, report)
@@ -2562,7 +2580,7 @@ def run_mapping(
             progress_callback,
             progress_total,
             progress_total,
-            "映射完成。",
+            "映射完成",
         )
     if show_progress:
         for output_file in output_paths:
