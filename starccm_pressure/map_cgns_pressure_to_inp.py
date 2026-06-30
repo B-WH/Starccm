@@ -21,9 +21,10 @@ import json
 import math
 import os
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 import numpy as np
 
@@ -31,6 +32,17 @@ from starccm_pressure.optional_deps import load_ckdtree
 
 
 StepKind = Literal["steady_state", "dynamic_explicit", "dynamic", "unknown"]
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _report_mapping_progress(
+    progress_callback: ProgressCallback | None,
+    current: int,
+    total: int,
+    message: str,
+) -> None:
+    if progress_callback is not None:
+        progress_callback({"current": current, "total": total, "message": message})
 
 
 class FileSizeLimitError(ValueError):
@@ -85,8 +97,12 @@ class AbaqusModel:
     lines: list[str]
     nodes: dict[int, np.ndarray]
     elements: dict[int, AbaqusElement]
+    nodes_by_part: dict[str, dict[int, np.ndarray]]
+    elements_by_part: dict[str, dict[int, AbaqusElement]]
     nsets: dict[str, set[int]]
     elsets: dict[str, set[int]]
+    set_instances: dict[tuple[str, str], str | None]
+    instance_parts: dict[str, str]
     steps: list[AbaqusStep]
 
 
@@ -224,6 +240,19 @@ def _parse_set_values(lines: list[str], start: int, generated: bool) -> tuple[se
     return values, index
 
 
+def _remember_set_instance(
+    set_instances: dict[tuple[str, str], str | None],
+    set_type: str,
+    set_name: str,
+    instance_name: str,
+) -> None:
+    key = (set_type.lower(), set_name.upper())
+    previous = set_instances.get(key)
+    if previous is None and key in set_instances:
+        return
+    set_instances[key] = instance_name if previous in {None, instance_name} else None
+
+
 def parse_inp_text(text: str) -> AbaqusModel:
     """解析压力映射所需的 INP 子集。
 
@@ -239,9 +268,14 @@ def parse_inp_text(text: str) -> AbaqusModel:
     lines = text.splitlines()
     nodes: dict[int, np.ndarray] = {}
     elements: dict[int, AbaqusElement] = {}
+    nodes_by_part: dict[str, dict[int, np.ndarray]] = {}
+    elements_by_part: dict[str, dict[int, AbaqusElement]] = {}
     nsets: dict[str, set[int]] = {}
     elsets: dict[str, set[int]] = {}
+    set_instances: dict[tuple[str, str], str | None] = {}
+    instance_parts: dict[str, str] = {}
     raw_steps: list[tuple[str, int, int, list[str]]] = []
+    current_part: str | None = None
 
     index = 0
     while index < len(lines):
@@ -259,6 +293,24 @@ def parse_inp_text(text: str) -> AbaqusModel:
         keyword = _keyword_name(stripped)
         params = _parse_keyword_params(stripped)
 
+        if keyword == "*part":
+            current_part = str(params.get("name", "")).strip() or None
+            index += 1
+            continue
+
+        if keyword == "*end part":
+            current_part = None
+            index += 1
+            continue
+
+        if keyword == "*instance":
+            instance_name = str(params.get("name", "")).strip()
+            part_name = str(params.get("part", "")).strip()
+            if instance_name and part_name:
+                instance_parts[instance_name] = part_name
+            index += 1
+            continue
+
         if keyword == "*node":
             index += 1
             while index < len(lines) and not lines[index].lstrip().startswith("*"):
@@ -271,6 +323,10 @@ def parse_inp_text(text: str) -> AbaqusModel:
                         [float(parts[1]), float(parts[2]), float(parts[3])],
                         dtype=float,
                     )
+                    if current_part:
+                        nodes_by_part.setdefault(current_part, {})[int(parts[0])] = nodes[
+                            int(parts[0])
+                        ]
                 index += 1
             continue
 
@@ -290,6 +346,10 @@ def parse_inp_text(text: str) -> AbaqusModel:
                         element_type=element_type,
                         node_ids=numbers[1:],
                     )
+                    if current_part:
+                        elements_by_part.setdefault(current_part, {})[
+                            element_id
+                        ] = elements[element_id]
                     if header_elset:
                         elsets.setdefault(header_elset.upper(), set()).add(element_id)
                 index += 1
@@ -304,6 +364,14 @@ def parse_inp_text(text: str) -> AbaqusModel:
             values, index = _parse_set_values(lines, index + 1, generated)
             target = nsets if keyword == "*nset" else elsets
             target.setdefault(set_name.upper(), set()).update(values)
+            instance_name = str(params.get("instance", "")).strip()
+            if instance_name:
+                _remember_set_instance(
+                    set_instances,
+                    name_key,
+                    set_name,
+                    instance_name,
+                )
             continue
 
         if keyword == "*step":
@@ -332,8 +400,12 @@ def parse_inp_text(text: str) -> AbaqusModel:
         lines=lines,
         nodes=nodes,
         elements=elements,
+        nodes_by_part=nodes_by_part,
+        elements_by_part=elements_by_part,
         nsets=nsets,
         elsets=elsets,
+        set_instances=set_instances,
+        instance_parts=instance_parts,
         steps=steps,
     )
 
@@ -422,6 +494,38 @@ def _area_vector(points: np.ndarray) -> np.ndarray:
     return vector
 
 
+def _lookup_case_insensitive(mapping: dict[str, Any], name: str) -> Any | None:
+    for key, value in mapping.items():
+        if key.upper() == name.upper():
+            return value
+    return None
+
+
+def _target_instance_name(
+    model: AbaqusModel,
+    target_set: str,
+    target_set_type: Literal["nset", "elset"],
+) -> str | None:
+    return model.set_instances.get((target_set_type.lower(), target_set.upper()))
+
+
+def _target_part_name(
+    model: AbaqusModel,
+    target_set: str,
+    target_set_type: Literal["nset", "elset"],
+) -> str | None:
+    instance_name = _target_instance_name(model, target_set, target_set_type)
+    if not instance_name:
+        return None
+    part_name = _lookup_case_insensitive(model.instance_parts, instance_name)
+    if not part_name:
+        raise ValueError(
+            f"Target {target_set_type} '{target_set}' references instance "
+            f"'{instance_name}', but the matching *Instance definition was not found."
+        )
+    return str(part_name)
+
+
 def select_target_faces(
     model: AbaqusModel,
     target_set: str,
@@ -445,6 +549,17 @@ def select_target_faces(
     """
     normalized_set = target_set.upper()
     selected_faces: list[list[int]] = []
+    part_name = _target_part_name(model, target_set, target_set_type)
+    nodes = model.nodes
+    elements = model.elements
+    if part_name is not None:
+        nodes = _lookup_case_insensitive(model.nodes_by_part, part_name)
+        elements = _lookup_case_insensitive(model.elements_by_part, part_name)
+        if nodes is None or elements is None:
+            raise ValueError(
+                f"Target {target_set_type} '{target_set}' references part "
+                f"'{part_name}', but that part's mesh was not parsed."
+            )
 
     if target_set_type.lower() == "elset":
         if normalized_set not in model.elsets:
@@ -453,7 +568,7 @@ def select_target_faces(
         face_counts: dict[tuple[int, ...], int] = {}
         candidate_faces: list[list[int]] = []
         for element_id in element_ids:
-            element = model.elements.get(element_id)
+            element = elements.get(element_id)
             if element is None:
                 raise ValueError(f"Elset '{target_set}' references missing element {element_id}.")
             for face in _element_face_node_ids(element):
@@ -472,14 +587,14 @@ def select_target_faces(
         # the model — a major bottleneck for large INP files where the
         # wetted surface is a small fraction of the total element count.
         node_to_element_ids: dict[int, set[int]] = {}
-        for element_id, element in model.elements.items():
+        for element_id, element in elements.items():
             for node_id in element.node_ids:
                 node_to_element_ids.setdefault(node_id, set()).add(element_id)
         candidate_ids: set[int] = set()
         for node_id in selected_nodes:
             candidate_ids.update(node_to_element_ids.get(node_id, ()))
         for element_id in candidate_ids:
-            element = model.elements[element_id]
+            element = elements[element_id]
             for face in _element_face_node_ids(element):
                 if all(node_id in selected_nodes for node_id in face):
                     selected_faces.append(face)
@@ -494,7 +609,7 @@ def select_target_faces(
     face_points: list[np.ndarray] = []
     for face in selected_faces:
         try:
-            points = np.vstack([model.nodes[node_id] for node_id in face])
+            points = np.vstack([nodes[node_id] for node_id in face])
         except KeyError as exc:
             raise ValueError(f"Face references missing node {exc.args[0]}.") from exc
         face_points.append(points)
@@ -1362,6 +1477,7 @@ def write_frequency_load_include(
     node_forces: dict[int, np.ndarray],
     frequency_hz: float,
     load_name: str = "CGNS_PRESSURE",
+    node_label_prefix: str = "",
 ) -> None:
     """写出单个频率的 Abaqus 复数集中力 include。
 
@@ -1382,14 +1498,20 @@ def write_frequency_load_include(
         for component in range(3):
             value = float(np.real(force[component]))
             if value != 0.0:
-                lines.append(f"{node_id}, {component + 1}, {_format_float(value)}")
+                lines.append(
+                    f"{_format_cload_node(node_id, node_label_prefix)}, "
+                    f"{component + 1}, {_format_float(value)}"
+                )
     lines.extend(["** Imaginary part", "*CLOAD, IMAGINARY"])
     for node_id in sorted(node_forces):
         force = np.asarray(node_forces[node_id])
         for component in range(3):
             value = float(np.imag(force[component]))
             if value != 0.0:
-                lines.append(f"{node_id}, {component + 1}, {_format_float(value)}")
+                lines.append(
+                    f"{_format_cload_node(node_id, node_label_prefix)}, "
+                    f"{component + 1}, {_format_float(value)}"
+                )
     include_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1399,6 +1521,7 @@ def write_frequency_table_load_include(
     frequencies_hz: list[float],
     load_name: str = "CGNS_PRESSURE",
     relative_zero_tolerance: float = 1.0e-12,
+    node_label_prefix: str = "",
 ) -> dict[str, int | float]:
     """写出稳态动力学频率相关载荷 include 文件。
 
@@ -1479,7 +1602,10 @@ def write_frequency_table_load_include(
                                 f"{freq_str}, {_format_float(float(value))}\n"
                             )
                         fh.write(f"*CLOAD, REAL, amplitude={amp_name}\n")
-                        fh.write(f"{node_id}, {component + 1}, 1.\n")
+                        fh.write(
+                            f"{_format_cload_node(node_id, node_label_prefix)}, "
+                            f"{component + 1}, 1.\n"
+                        )
                         load_table_count += 1
                         active_cload_count += 1
                     else:
@@ -1495,7 +1621,10 @@ def write_frequency_table_load_include(
                                 f"{freq_str}, {_format_float(float(value))}\n"
                             )
                         fh.write(f"*CLOAD, IMAGINARY, amplitude={amp_name}\n")
-                        fh.write(f"{node_id}, {component + 1}, 1.\n")
+                        fh.write(
+                            f"{_format_cload_node(node_id, node_label_prefix)}, "
+                            f"{component + 1}, 1.\n"
+                        )
                         load_table_count += 1
                         active_cload_count += 1
                     else:
@@ -1545,6 +1674,7 @@ def write_time_load_include(
     node_force_series: dict[int, np.ndarray],
     times: np.ndarray,
     max_records: int = 500000,
+    node_label_prefix: str = "",
 ) -> None:
     """写出瞬态/显式动力学使用的时域集中力 include。
 
@@ -1581,7 +1711,10 @@ def write_time_load_include(
             ]
             lines.extend(pairs)
             lines.append(f"*CLOAD, amplitude={amp_name}")
-            lines.append(f"{node_id}, {component + 1}, 1.")
+            lines.append(
+                f"{_format_cload_node(node_id, node_label_prefix)}, "
+                f"{component + 1}, 1."
+            )
     if active_records == 0:
         lines.append("** No nonzero time-domain loads were generated.")
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1746,6 +1879,144 @@ def _load_complex_spectrum(
     return frequencies, pressure
 
 
+def _discard_bytes(reader: Any, byte_count: int) -> None:
+    remaining = int(byte_count)
+    while remaining > 0:
+        chunk = reader.read(min(remaining, 1024 * 1024))
+        if not chunk:
+            raise ValueError("Unexpected end of npz array while skipping rows.")
+        remaining -= len(chunk)
+
+
+def _read_npy_header(reader: Any) -> tuple[tuple[int, ...], bool, np.dtype[Any]]:
+    version = np.lib.format.read_magic(reader)
+    if version == (1, 0):
+        shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(reader)
+    elif version in {(2, 0), (3, 0)}:
+        shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(reader)
+    else:
+        raise ValueError(f"Unsupported npy version in npz member: {version}")
+    return tuple(int(value) for value in shape), bool(fortran_order), np.dtype(dtype)
+
+
+class _NpzArrayRowStream:
+    def __init__(self, archive: zipfile.ZipFile, member_name: str):
+        self._reader = archive.open(member_name)
+        shape, fortran_order, dtype = _read_npy_header(self._reader)
+        if fortran_order:
+            raise ValueError(f"{member_name} must be C-contiguous.")
+        if len(shape) != 2:
+            raise ValueError(f"{member_name} must be a two-dimensional array.")
+        self.shape = tuple(int(value) for value in shape)
+        self.dtype = np.dtype(dtype)
+        self._row_bytes = self.shape[1] * self.dtype.itemsize
+        self._current_row = 0
+        self._last_row_index: int | None = None
+        self._last_row: np.ndarray | None = None
+
+    def close(self) -> None:
+        self._reader.close()
+
+    def read_rows(self, row_indices: np.ndarray) -> np.ndarray:
+        rows = np.asarray(row_indices, dtype=int)
+        result = np.empty((rows.size, self.shape[1]), dtype=self.dtype)
+        for output_index, row_index in enumerate(rows):
+            if row_index < 0 or row_index >= self.shape[0]:
+                raise IndexError("pressure spectrum row index is out of bounds.")
+            if row_index == self._last_row_index and self._last_row is not None:
+                result[output_index] = self._last_row
+                continue
+            if row_index < self._current_row:
+                raise ValueError(
+                    "streamed pressure spectrum rows must be requested in ascending order."
+                )
+            _discard_bytes(self._reader, (row_index - self._current_row) * self._row_bytes)
+            raw = self._reader.read(self._row_bytes)
+            if len(raw) != self._row_bytes:
+                raise ValueError("Unexpected end of npz array while reading a row.")
+            row = np.frombuffer(raw, dtype=self.dtype, count=self.shape[1]).copy()
+            result[output_index] = row
+            self._current_row = row_index + 1
+            self._last_row_index = row_index
+            self._last_row = row
+        return np.asarray(result, dtype=float)
+
+
+class _ComplexSpectrumRowReader:
+    def __init__(self, path: Path):
+        if not path.exists():
+            raise FileNotFoundError(f"Required complex spectrum file was not found: {path}")
+        self.path = path
+        self.frequencies = self._load_frequencies(path)
+        self._archive: zipfile.ZipFile | None = None
+        self._real: _NpzArrayRowStream | None = None
+        self._imag: _NpzArrayRowStream | None = None
+        self.source_count = 0
+
+    @staticmethod
+    def _load_frequencies(path: Path) -> np.ndarray:
+        with np.load(path) as saved:
+            return np.asarray(saved["frequencies_hz"], dtype=float)
+
+    def __enter__(self) -> "_ComplexSpectrumRowReader":
+        self._archive = zipfile.ZipFile(self.path)
+        try:
+            self._real = _NpzArrayRowStream(self._archive, "pressure_real.npy")
+            self._imag = _NpzArrayRowStream(self._archive, "pressure_imag.npy")
+            if self._real.shape != self._imag.shape:
+                raise ValueError("pressure_real and pressure_imag must have matching shapes.")
+            if self._real.shape[0] != self.frequencies.size:
+                raise ValueError("pressure spectrum row count must match frequencies_hz.")
+            self.source_count = self._real.shape[1]
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._real is not None:
+            self._real.close()
+            self._real = None
+        if self._imag is not None:
+            self._imag.close()
+            self._imag = None
+        if self._archive is not None:
+            self._archive.close()
+            self._archive = None
+
+    def close(self) -> None:
+        self.__exit__(None, None, None)
+
+    def __del__(self) -> None:
+        self.close()
+
+    def read_complex_rows(self, row_indices: np.ndarray) -> np.ndarray:
+        if self._real is None or self._imag is None:
+            raise RuntimeError("Complex spectrum reader is not open.")
+        real = self._real.read_rows(row_indices)
+        imag = self._imag.read_rows(row_indices)
+        return real + 1j * imag
+
+
+def _is_non_decreasing(values: list[int]) -> bool:
+    return all(left <= right for left, right in zip(values, values[1:]))
+
+
+def _target_node_label_prefix(
+    model: AbaqusModel,
+    target_set: str,
+    target_set_type: Literal["nset", "elset"],
+) -> str:
+    instance_name = model.set_instances.get(
+        (target_set_type.lower(), target_set.upper())
+    )
+    return f"{instance_name}." if instance_name else ""
+
+
+def _format_cload_node(node_id: int, node_label_prefix: str = "") -> str:
+    return f"{node_label_prefix}{node_id}" if node_label_prefix else str(node_id)
+
+
 def _load_time_pressure(
     extracted_dir: Path,
     name: str,
@@ -1903,6 +2174,7 @@ def run_mapping(
     frequency_batch_size: int | None = None,
     relative_zero_tolerance: float = 1.0e-12,
     show_progress: bool = True,
+    progress_callback: ProgressCallback | None = None,
     num_workers: int = 1,
 ) -> MappingResult:
     """执行完整压力映射流程并写出新 INP。
@@ -1934,6 +2206,7 @@ def run_mapping(
         frequency_batch_size: 频率分块大小；为 None 时根据内存自动计算。
         relative_zero_tolerance: 相对全局最大力幅值的近零过滤阈值。
         show_progress: 是否在控制台输出进度信息；默认开启。
+        progress_callback: 可选 GUI/调用方进度回调。
         num_workers: 并行处理频率批次的线程数；默认 1（串行）。
             设为 0 则使用 ``min(32, os.cpu_count() + 4)``。
             多线程通过 ``ThreadPoolExecutor`` 实现，利用 NumPy
@@ -1958,6 +2231,7 @@ def run_mapping(
     model = parse_inp_file(inp)
     step = _load_model_step(model, step_name)
     target_faces = select_target_faces(model, target_set, target_set_type)
+    node_label_prefix = _target_node_label_prefix(model, target_set, target_set_type)
     source_centers, source_area_vectors = _load_surface_geometry(extracted, surface_geometry_name)
     transformed_source_centers = apply_coordinate_transform(
         source_centers,
@@ -1987,8 +2261,10 @@ def run_mapping(
         "axis_order": list(axis_order),
         "axis_sign": list(axis_sign),
         "translate": None if translate is None else np.asarray(translate, dtype=float).tolist(),
+        "load_node_label_prefix": node_label_prefix,
         "mapping_assumptions": _mapping_assumptions(),
     }
+    progress_total: int | None = None
 
     if step.kind == "steady_state":
         if not frequencies:
@@ -1996,13 +2272,12 @@ def run_mapping(
 
         if show_progress:
             print("加载复数压力谱…")
-        extracted_frequencies, pressure_spectrum = _load_complex_spectrum(
-            extracted,
-            complex_spectrum_name,
-        )
+        spectrum_reader = _ComplexSpectrumRowReader(extracted / complex_spectrum_name)
+        spectrum_reader.__enter__()
+        extracted_frequencies = spectrum_reader.frequencies
 
         if show_progress:
-            print(f"  源面数量: {pressure_spectrum.shape[1]}, "
+            print(f"  源面数量: {spectrum_reader.source_count}, "
                   f"提取频率数: {len(extracted_frequencies)}")
             print("构建一致力积分方案…")
         consistent_force_plan = build_consistent_force_plan(
@@ -2023,6 +2298,11 @@ def run_mapping(
             )
             for requested_frequency in frequencies
         ]
+        if not _is_non_decreasing(spectrum_indices):
+            spectrum_reader.close()
+            raise ValueError(
+                "Streamed frequency mapping requires requested frequencies in ascending order."
+            )
 
         # ── 频率分块 ────────────────────────────────────
         if frequency_batch_size is not None and frequency_batch_size > 0:
@@ -2030,17 +2310,32 @@ def run_mapping(
         else:
             batch_size = _auto_batch_size(
                 len(spectrum_indices),
-                n_sources=pressure_spectrum.shape[1],
+                n_sources=spectrum_reader.source_count,
                 n_scatter=consistent_force_plan.indices.shape[0] * 4,
                 memory_limit_mb=512.0,
             )
         batch_count = max(1, (len(spectrum_indices) + batch_size - 1) // batch_size)
+        progress_total = batch_count + 4
+        _report_mapping_progress(
+            progress_callback,
+            1,
+            progress_total,
+            "已加载 INP、几何和压力谱。",
+        )
+        _report_mapping_progress(
+            progress_callback,
+            2,
+            progress_total,
+            "已构建一致力积分方案。",
+        )
 
         # ── 解析并行度 ─────────────────────────────────
         workers = int(num_workers)
         if workers == 0:
             workers = min(32, (getattr(os, "cpu_count", lambda: 4)() or 4) + 4)
-        use_parallel = workers > 1 and batch_count > 1
+        # ponytail: compressed npz row streaming is sequential; add bounded
+        # prefetch if profiling shows CPU, not IO, is the bottleneck.
+        use_parallel = False
 
         if show_progress and batch_count > 1:
             if use_parallel:
@@ -2064,7 +2359,7 @@ def run_mapping(
             list[dict[str, float | int]],
         ]:
             _batch_start, batch_slice = spec
-            batch_pressures = pressure_spectrum[batch_slice]
+            batch_pressures = spectrum_reader.read_complex_rows(batch_slice)
             return _map_complex_pressure_batch_to_nodes(
                 target_faces.node_ids,
                 target_faces.face_points,
@@ -2089,6 +2384,12 @@ def run_mapping(
                     batch_force_maps, batch_chunk_stats = future.result()
                     all_force_maps.extend(batch_force_maps)
                     all_batch_stats.extend(batch_chunk_stats)
+                    _report_mapping_progress(
+                        progress_callback,
+                        idx + 3,
+                        progress_total,
+                        f"频率块 {idx + 1}/{batch_count} 完成。",
+                    )
                     if show_progress:
                         print(f"  频率块 {idx + 1}/{batch_count} 完成")
         else:
@@ -2101,9 +2402,16 @@ def run_mapping(
                     print("    完成")
                 all_force_maps.extend(batch_force_maps)
                 all_batch_stats.extend(batch_chunk_stats)
+                _report_mapping_progress(
+                    progress_callback,
+                    batch_idx + 3,
+                    progress_total,
+                    f"频率块 {batch_idx + 1}/{batch_count} 完成。",
+                )
 
         node_force_maps = all_force_maps
         batch_stats = all_batch_stats
+        spectrum_reader.close()
 
         per_frequency_stats: list[dict[str, Any]] = []
         mapped_frequencies: list[float] = []
@@ -2132,6 +2440,7 @@ def run_mapping(
                 include_path,
                 node_force_maps[0],
                 frequency_hz=mapped_frequencies[0],
+                node_label_prefix=node_label_prefix,
             )
             frequency_table_stats: dict[str, int | float] = {
                 "frequency_count": 1,
@@ -2147,9 +2456,16 @@ def run_mapping(
                 node_force_maps,
                 mapped_frequencies,
                 relative_zero_tolerance=relative_zero_tolerance,
+                node_label_prefix=node_label_prefix,
             )
         include_paths.append(include_path)
         output_paths.append(output)
+        _report_mapping_progress(
+            progress_callback,
+            progress_total - 1,
+            progress_total,
+            "已写出载荷 include。",
+        )
         report.update(
             {
                 "frequencies_hz": mapped_frequencies,
@@ -2171,6 +2487,13 @@ def run_mapping(
             transformed_source_centers,
             k=k,
         )
+        progress_total = int(pressure_time.shape[0]) + 3
+        _report_mapping_progress(
+            progress_callback,
+            1,
+            progress_total,
+            "已加载 INP、几何和时域压力。",
+        )
         node_series: dict[int, np.ndarray] = {}
         last_stats: dict[str, float | int] = {}
         for time_index in range(pressure_time.shape[0]):
@@ -2190,15 +2513,28 @@ def run_mapping(
                 if node_id not in node_series:
                     node_series[node_id] = np.zeros((pressure_time.shape[0], 3), dtype=float)
                 node_series[node_id][time_index] = np.real(force)
+            _report_mapping_progress(
+                progress_callback,
+                time_index + 2,
+                progress_total,
+                f"时间步 {time_index + 1}/{pressure_time.shape[0]} 完成。",
+            )
         include_path = output.with_name(f"{output.stem}_loads.inc")
         write_time_load_include(
             include_path,
             node_series,
             times,
             max_records=max_time_records,
+            node_label_prefix=node_label_prefix,
         )
         include_paths.append(include_path)
         output_paths.append(output)
+        _report_mapping_progress(
+            progress_callback,
+            progress_total - 1,
+            progress_total,
+            "已写出载荷 include。",
+        )
         report.update(
             {
                 "time_sample_count": int(len(times)),
@@ -2221,6 +2557,13 @@ def run_mapping(
         output_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     report_path = output.with_name(report_name)
     _write_mapping_report(report_path, report)
+    if progress_total is not None:
+        _report_mapping_progress(
+            progress_callback,
+            progress_total,
+            progress_total,
+            "映射完成。",
+        )
     if show_progress:
         for output_file in output_paths:
             print(f"  {output_file}")

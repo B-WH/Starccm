@@ -61,7 +61,7 @@ def run_gui() -> int:
 
     root = tk.Tk()
     root.title("CGNS 压力到 INP 映射")
-    root.geometry("840x680")
+    root.geometry("840x720")
     root.resizable(False, False)
 
     inp_var = tk.StringVar(value="")
@@ -75,6 +75,8 @@ def run_gui() -> int:
     axis_order_var = tk.StringVar(value="0,1,2")
     axis_sign_var = tk.StringVar(value="1,1,1")
     num_workers_var = tk.StringVar(value="1")
+    progress_var = tk.DoubleVar(value=0.0)
+    progress_text_var = tk.StringVar(value="")
     status_var = tk.StringVar(value="就绪")
 
     frame = ttk.Frame(root, padding=16)
@@ -210,8 +212,18 @@ def run_gui() -> int:
         if path:
             output_var.set(path)
 
+    def update_progress(event: dict[str, object]) -> None:
+        current = float(event.get("current", 0) or 0)
+        total = float(event.get("total", 0) or 0)
+        progress_var.set(100.0 * current / total if total else 0.0)
+        progress_text_var.set(str(event.get("message", "")))
+        root.update_idletasks()
+
     def run_job() -> None:
         try:
+            progress_var.set(0.0)
+            progress_text_var.set("正在准备映射...")
+            root.update_idletasks()
             validate_mapping_gui_inputs(
                 inp_var.get(),
                 extracted_var.get(),
@@ -232,12 +244,17 @@ def run_gui() -> int:
                 axis_order=axis_order,
                 axis_sign=axis_sign,
                 num_workers=num_workers,
+                show_progress=False,
+                progress_callback=update_progress,
             )
         except Exception as exc:
             message = format_gui_error(exc)
             status_var.set(f"错误：{message}")
+            progress_text_var.set("映射失败。")
             messagebox.showerror("映射失败", message)
             return
+        progress_var.set(100.0)
+        progress_text_var.set("映射完成。")
         status_var.set(f"已写入 {result.output_inp_path}")
         messagebox.showinfo("完成", f"已写入：\n{result.output_inp_path}")
 
@@ -314,8 +331,22 @@ def run_gui() -> int:
     ttk.Button(actions, text="预览坐标对齐", command=preview_alignment).grid(row=0, column=0)
     ttk.Button(actions, text="开始映射", command=run_job).grid(row=0, column=1, padx=(8, 0))
 
-    ttk.Label(frame, textvariable=status_var, wraplength=700).grid(
+    ttk.Progressbar(frame, variable=progress_var, maximum=100.0, length=520).grid(
         row=12,
+        column=1,
+        sticky="ew",
+        pady=(8, 0),
+    )
+    ttk.Label(frame, textvariable=progress_text_var, wraplength=700).grid(
+        row=13,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(6, 0),
+    )
+
+    ttk.Label(frame, textvariable=status_var, wraplength=700).grid(
+        row=14,
         column=0,
         columnspan=3,
         sticky="w",

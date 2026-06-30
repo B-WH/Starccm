@@ -143,6 +143,48 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         np.testing.assert_allclose(faces.centers, [[0.5, 0.5, 0.0]])
         np.testing.assert_allclose(faces.area_vectors, [[0.0, 0.0, 1.0]])
 
+    def test_select_target_faces_uses_instance_part_mesh_when_ids_overlap(self) -> None:
+        model = parse_inp_text(
+            "\n".join(
+                [
+                    "*Part, name=Hull",
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4",
+                    "10, 1, 2, 3, 4",
+                    "*End Part",
+                    "*Part, name=Other",
+                    "*Node",
+                    "1, 0, 0, 10",
+                    "2, 2, 0, 10",
+                    "3, 2, 2, 10",
+                    "4, 0, 2, 10",
+                    "*Element, type=S4",
+                    "10, 1, 2, 3, 4",
+                    "*End Part",
+                    "*Assembly, name=Assembly",
+                    "*Instance, name=Hull-1, part=Hull",
+                    "*End Instance",
+                    "*Instance, name=Other-1, part=Other",
+                    "*End Instance",
+                    "*Elset, elset=SURF, instance=Hull-1",
+                    "10",
+                    "*End Assembly",
+                    "*Step",
+                    "*Dynamic, Explicit",
+                    "*End Step",
+                ]
+            )
+        )
+
+        faces = select_target_faces(model, "SURF", "elset")
+
+        np.testing.assert_allclose(faces.centers, [[0.5, 0.5, 0.0]])
+        np.testing.assert_allclose(faces.area_vectors, [[0.0, 0.0, 1.0]])
+
     def test_transform_area_vectors_scales_area_by_square_of_coordinate_scale(self) -> None:
         transformed = transform_area_vectors(
             np.array([[0.0, 0.0, 1.0]], dtype=float),
@@ -422,6 +464,67 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         self.assertEqual(report["step_kind"], "steady_state")
         self.assertEqual(report["target_set"], "SURF")
 
+    def test_run_mapping_prefixes_cload_nodes_for_assembly_instance_set(self) -> None:
+        inp_path = Path("map_test_model.inp")
+        output_path = Path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Heading",
+                    "*Part, name=Hull",
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4",
+                    "10, 1, 2, 3, 4",
+                    "*End Part",
+                    "*Assembly, name=Assembly",
+                    "*Instance, name=Hull-1, part=Hull",
+                    "*End Instance",
+                    "*Elset, elset=SURF, instance=Hull-1",
+                    "10",
+                    "*End Assembly",
+                    "*Step, name=HARMONIC",
+                    "*Steady State Dynamics",
+                    "100., 100., 1",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            "map_test_surface_geometry.npz",
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        np.savez_compressed(
+            "map_test_pressure_complex_spectrum.npz",
+            frequencies_hz=np.array([100.0], dtype=float),
+            pressure_real=np.array([[8.0]], dtype=float),
+            pressure_imag=np.array([[6.0]], dtype=float),
+        )
+
+        run_mapping(
+            inp_path=inp_path,
+            extracted_dir=Path("."),
+            target_set="SURF",
+            target_set_type="elset",
+            frequencies=[100.0],
+            output_path=output_path,
+            surface_geometry_name="map_test_surface_geometry.npz",
+            complex_spectrum_name="map_test_pressure_complex_spectrum.npz",
+        )
+
+        include_text = Path("map_test_model_mapped_loads.inc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Hull-1.1, 3, -2", include_text)
+        self.assertNotIn("\n1, 3, -2", include_text)
+        report = json.loads(Path("mapping_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["load_node_label_prefix"], "Hull-1.")
+
     def test_run_mapping_writes_all_requested_frequencies_into_one_inp(self) -> None:
         _unlink_test_file(Path("map_test_model_mapped_100Hz_loads.inc"))
         _unlink_test_file(Path("map_test_model_mapped_200Hz_loads.inc"))
@@ -550,6 +653,114 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
             )
 
         self.assertEqual(calls, [(4, 2)])
+
+    def test_run_mapping_streams_requested_frequency_rows(self) -> None:
+        from starccm_pressure import map_cgns_pressure_to_inp as mapper
+
+        inp_path = Path("map_test_model.inp")
+        output_path = Path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step, name=HARMONIC",
+                    "*Steady State Dynamics",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            "map_test_surface_geometry.npz",
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        np.savez_compressed(
+            "map_test_pressure_complex_spectrum.npz",
+            frequencies_hz=np.array([100.0, 200.0, 300.0], dtype=float),
+            pressure_real=np.array([[99.0], [8.0], [2.0]], dtype=float),
+            pressure_imag=np.array([[99.0], [6.0], [1.0]], dtype=float),
+        )
+
+        with patch.object(
+            mapper,
+            "_load_complex_spectrum",
+            side_effect=AssertionError("full complex spectrum should not be loaded"),
+        ):
+            run_mapping(
+                inp_path=inp_path,
+                extracted_dir=Path("."),
+                target_set="SURF",
+                target_set_type="elset",
+                frequencies=[200.0, 300.0],
+                output_path=output_path,
+                surface_geometry_name="map_test_surface_geometry.npz",
+                complex_spectrum_name="map_test_pressure_complex_spectrum.npz",
+                frequency_batch_size=1,
+                show_progress=False,
+            )
+
+        include_text = Path("map_test_model_mapped_loads.inc").read_text(encoding="utf-8")
+        self.assertIn("200, -2", include_text)
+        self.assertIn("300, -0.5", include_text)
+        self.assertNotIn("100,", include_text)
+
+    def test_run_mapping_reports_progress_callback_for_steady_state_batches(self) -> None:
+        inp_path = Path("map_test_model.inp")
+        output_path = Path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step, name=HARMONIC",
+                    "*Steady State Dynamics",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            "map_test_surface_geometry.npz",
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        np.savez_compressed(
+            "map_test_pressure_complex_spectrum.npz",
+            frequencies_hz=np.array([100.0, 200.0], dtype=float),
+            pressure_real=np.array([[8.0], [2.0]], dtype=float),
+            pressure_imag=np.array([[6.0], [1.0]], dtype=float),
+        )
+        events: list[dict[str, object]] = []
+
+        run_mapping(
+            inp_path=inp_path,
+            extracted_dir=Path("."),
+            target_set="SURF",
+            target_set_type="elset",
+            frequencies=[100.0, 200.0],
+            output_path=output_path,
+            surface_geometry_name="map_test_surface_geometry.npz",
+            complex_spectrum_name="map_test_pressure_complex_spectrum.npz",
+            frequency_batch_size=1,
+            show_progress=False,
+            progress_callback=events.append,
+        )
+
+        self.assertGreaterEqual(len(events), 4)
+        self.assertEqual(events[-1]["current"], events[-1]["total"])
+        self.assertTrue(any("频率块 1/2" in str(event["message"]) for event in events))
 
     def test_frequency_outside_tolerance_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "No extracted frequency"):
@@ -800,6 +1011,12 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
             "轴顺序必须是 0,1,2 的排列",
             format_gui_error(ValueError("axis_order must be a permutation of 0, 1, 2.")),
         )
+
+    def test_mapping_gui_wires_progressbar_to_mapping_callback(self) -> None:
+        source = Path("starccm_pressure/mapping_gui.py").read_text(encoding="utf-8")
+
+        self.assertIn("ttk.Progressbar", source)
+        self.assertIn("progress_callback=update_progress", source)
 
     def test_mapping_report_documents_physical_mapping_assumptions(self) -> None:
         inp_path = Path("map_test_model.inp")
