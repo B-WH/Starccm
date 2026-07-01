@@ -37,8 +37,18 @@ class ProjectConfigurationTests(unittest.TestCase):
         self.assertIn("比例系数", readme)
         self.assertIn("平移 dx,dy,dz", readme)
         self.assertIn("轴顺序", readme)
+        self.assertIn("work/test-output/", readme)
+        self.assertIn("--frequency-group-mode", readme)
+        self.assertIn("--frequency-group-value", readme)
         self.assertIn("pip install .[speed]", readme)
         self.assertIn("pip install .[speed]", packaging_readme)
+
+    def test_packaging_clean_is_manual_only(self) -> None:
+        build_script = Path("packaging/build_exe.ps1").read_text(encoding="utf-8")
+
+        self.assertNotIn("Remove-Item", build_script)
+        self.assertNotIn("Get-ChildItem", build_script)
+        self.assertIn("does not delete files automatically", build_script)
 
     def test_optional_dependency_loader_module_exists(self) -> None:
         from starccm_pressure.optional_deps import load_ckdtree

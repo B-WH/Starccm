@@ -8,19 +8,14 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 if ($Clean) {
-    if (Test-Path -LiteralPath "build") {
-        Write-Host "Removing build directory..."
-        Remove-Item -LiteralPath "build" -Recurse -Force
-    }
-    if (Test-Path -LiteralPath "dist") {
-        Write-Host "Removing dist directory..."
-        Remove-Item -LiteralPath "dist" -Recurse -Force
-    }
-    $specFiles = Get-ChildItem -Path . -Filter "*.spec" -ErrorAction SilentlyContinue
-    foreach ($spec in $specFiles) {
-        Write-Host "Removing $($spec.Name)..."
-        Remove-Item -LiteralPath $spec.FullName -Force
-    }
+    Write-Host "Clean requested. This script does not delete files automatically."
+    Write-Host "Manual cleanup targets, if present:"
+    Write-Host "  build\"
+    Write-Host "  dist\"
+    Write-Host "  extract_cgns_pressure_cli.spec"
+    Write-Host "  extract_cgns_pressure_gui.spec"
+    Write-Host "  map_cgns_pressure_to_inp_cli.spec"
+    Write-Host "  map_cgns_pressure_to_inp_gui.spec"
 }
 
 python -B -m PyInstaller `

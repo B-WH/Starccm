@@ -32,6 +32,7 @@ from starccm_pressure.optional_deps import load_ckdtree
 
 
 StepKind = Literal["steady_state", "dynamic_explicit", "dynamic", "unknown"]
+FrequencyGroupMode = Literal["none", "groups", "bandwidth"]
 ProgressCallback = Callable[[dict[str, Any]], None]
 PREPRINT_NO_ECHO_LINE = "*Preprint, echo=NO, model=NO, history=NO"
 
@@ -2144,6 +2145,60 @@ def _frequency_suffix(frequency_hz: float) -> str:
     return f"{text}Hz"
 
 
+def _split_frequency_groups(
+    frequencies_hz: list[float],
+    mode: FrequencyGroupMode,
+    value: float | int | None,
+) -> list[tuple[int, int]]:
+    if mode == "none":
+        return [(0, len(frequencies_hz))]
+    if not frequencies_hz:
+        return []
+    if value is None:
+        raise ValueError("frequency_group_value is required when frequency grouping is enabled.")
+    if mode == "groups":
+        group_count_float = float(value)
+        group_count = int(group_count_float)
+        if group_count <= 0 or not math.isclose(group_count_float, float(group_count)):
+            raise ValueError("frequency_group_value must be a positive integer for groups mode.")
+        if group_count > len(frequencies_hz):
+            raise ValueError("frequency_group_value must not exceed the requested frequency count.")
+        base_size, extra = divmod(len(frequencies_hz), group_count)
+        groups: list[tuple[int, int]] = []
+        start = 0
+        for group_index in range(group_count):
+            size = base_size + (1 if group_index < extra else 0)
+            end = start + size
+            groups.append((start, end))
+            start = end
+        return groups
+    if mode == "bandwidth":
+        bandwidth = float(value)
+        if not math.isfinite(bandwidth) or bandwidth <= 0.0:
+            raise ValueError("frequency_group_value must be positive for bandwidth grouping.")
+        groups: list[tuple[int, int]] = []
+        start = 0
+        tolerance = bandwidth * 1.0e-12
+        while start < len(frequencies_hz):
+            end = start + 1
+            group_start = float(frequencies_hz[start])
+            while (
+                end < len(frequencies_hz)
+                and float(frequencies_hz[end]) - group_start < bandwidth - tolerance
+            ):
+                end += 1
+            groups.append((start, end))
+            start = end
+        return groups
+    raise ValueError(f"Unsupported frequency_group_mode: {mode}")
+
+
+def _grouped_output_path(output: Path, group_index: int, frequencies_hz: list[float]) -> Path:
+    start = _frequency_suffix(frequencies_hz[0])
+    end = _frequency_suffix(frequencies_hz[-1])
+    return output.with_name(f"{output.stem}_g{group_index:03d}_{start}-{end}{output.suffix}")
+
+
 def _load_model_step(model: AbaqusModel, requested_step: str | None) -> AbaqusStep:
     """选择接收载荷 include 的 Abaqus 分析步。
 
@@ -2189,6 +2244,8 @@ def run_mapping(
     report_name: str = "mapping_report.json",
     conserve_global_loads: bool = True,
     frequency_batch_size: int | None = None,
+    frequency_group_mode: FrequencyGroupMode = "none",
+    frequency_group_value: float | int | None = None,
     relative_zero_tolerance: float = 1.0e-12,
     show_progress: bool = True,
     progress_callback: ProgressCallback | None = None,
@@ -2221,6 +2278,8 @@ def run_mapping(
         report_name: 映射报告文件名。
         conserve_global_loads: 是否修正节点力以守恒源 CGNS 总力和总力矩。
         frequency_batch_size: 频率分块大小；为 None 时根据内存自动计算。
+        frequency_group_mode: 输出 INP 分组方式；默认 ``none`` 保持单个输出。
+        frequency_group_value: 分组值；``groups`` 时表示总组数，``bandwidth`` 时表示 Hz 带宽。
         relative_zero_tolerance: 相对全局最大力幅值的近零过滤阈值。
         show_progress: 是否在控制台输出进度信息；默认开启。
         progress_callback: 可选 GUI/调用方进度回调。
@@ -2447,36 +2506,62 @@ def run_mapping(
                     **stats,
                 }
             )
-        include_path = output.with_name(f"{output.stem}_loads.inc")
+        group_ranges = _split_frequency_groups(
+            mapped_frequencies,
+            frequency_group_mode,
+            frequency_group_value,
+        )
         if show_progress:
             n_nodes = len(set(nid for nf in node_force_maps for nid in nf))
             print(f"写出载荷 include ({len(node_force_maps)} 个频率, "
                   f"{n_nodes} 个受载节点)...")
-        if len(node_force_maps) == 1:
-            write_frequency_load_include(
-                include_path,
-                node_force_maps[0],
-                frequency_hz=mapped_frequencies[0],
-                node_label_prefix=node_label_prefix,
+        frequency_groups: list[dict[str, Any]] = []
+        for group_number, (start, end) in enumerate(group_ranges, start=1):
+            group_frequencies = mapped_frequencies[start:end]
+            group_force_maps = node_force_maps[start:end]
+            group_output = (
+                output
+                if frequency_group_mode == "none"
+                else _grouped_output_path(output, group_number, group_frequencies)
             )
-            frequency_table_stats: dict[str, int | float] = {
-                "frequency_count": 1,
-                "load_table_count": 0,
-                "active_cload_count": 0,
-                "skipped_near_zero_components": 0,
-                "global_max_abs_force": 0.0,
-                "relative_zero_tolerance": float(relative_zero_tolerance),
-            }
-        else:
-            frequency_table_stats = write_frequency_table_load_include(
-                include_path,
-                node_force_maps,
-                mapped_frequencies,
-                relative_zero_tolerance=relative_zero_tolerance,
-                node_label_prefix=node_label_prefix,
+            include_path = group_output.with_name(f"{group_output.stem}_loads.inc")
+            if len(group_force_maps) == 1:
+                write_frequency_load_include(
+                    include_path,
+                    group_force_maps[0],
+                    frequency_hz=group_frequencies[0],
+                    node_label_prefix=node_label_prefix,
+                )
+                frequency_table_stats: dict[str, int | float] = {
+                    "frequency_count": 1,
+                    "load_table_count": 0,
+                    "active_cload_count": 0,
+                    "skipped_near_zero_components": 0,
+                    "global_max_abs_force": 0.0,
+                    "relative_zero_tolerance": float(relative_zero_tolerance),
+                }
+            else:
+                frequency_table_stats = write_frequency_table_load_include(
+                    include_path,
+                    group_force_maps,
+                    group_frequencies,
+                    relative_zero_tolerance=relative_zero_tolerance,
+                    node_label_prefix=node_label_prefix,
+                )
+            include_paths.append(include_path)
+            output_paths.append(group_output)
+            frequency_groups.append(
+                {
+                    "group_index": group_number,
+                    "frequency_count": len(group_frequencies),
+                    "frequency_start_hz": group_frequencies[0],
+                    "frequency_end_hz": group_frequencies[-1],
+                    "frequencies_hz": group_frequencies,
+                    "output_inp": str(group_output),
+                    "include_file": str(include_path),
+                    "frequency_table_output": frequency_table_stats,
+                }
             )
-        include_paths.append(include_path)
-        output_paths.append(output)
         _report_mapping_progress(
             progress_callback,
             progress_total - 1,
@@ -2489,7 +2574,12 @@ def run_mapping(
                 "mapping_stats": per_frequency_stats[0]
                 if len(per_frequency_stats) == 1
                 else per_frequency_stats,
-                "frequency_table_output": frequency_table_stats,
+                "frequency_table_output": frequency_groups[0]["frequency_table_output"]
+                if len(frequency_groups) == 1
+                else [group["frequency_table_output"] for group in frequency_groups],
+                "frequency_group_mode": frequency_group_mode,
+                "frequency_group_value": frequency_group_value,
+                "frequency_groups": frequency_groups,
                 "include_file_count": len(include_paths),
                 "output_inp_count": len(output_paths),
                 "output_inps": [str(path) for path in output_paths],
@@ -2752,6 +2842,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of frequencies to process per batch; default processes all at once.",
     )
     parser.add_argument(
+        "--frequency-group-mode",
+        choices=("none", "groups", "bandwidth"),
+        default="none",
+        help="Output grouping mode for steady-state frequencies; default writes one INP.",
+    )
+    parser.add_argument(
+        "--frequency-group-value",
+        type=float,
+        default=None,
+        help="Group size: total group count or bandwidth in Hz.",
+    )
+    parser.add_argument(
         "--relative-zero-tolerance",
         type=float,
         default=1.0e-12,
@@ -2793,6 +2895,8 @@ def run_cli(argv: list[str] | None = None) -> int:
             axis_sign=args.axis_sign,
             max_time_records=args.max_time_records,
             frequency_batch_size=args.frequency_batch_size,
+            frequency_group_mode=args.frequency_group_mode,
+            frequency_group_value=args.frequency_group_value,
             relative_zero_tolerance=args.relative_zero_tolerance,
             num_workers=args.num_workers,
         )

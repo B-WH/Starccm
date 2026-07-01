@@ -1,6 +1,6 @@
 # Windows EXE 打包说明
 
-请在与目标机器相同架构的 Windows 环境中打包这两个工具。
+请在与目标机器相同架构的 Windows 环境中打包这些工具。
 
 ```powershell
 python -m venv .venv
@@ -21,8 +21,7 @@ pip install pyinstaller
 
 需要批处理时使用 CLI 版本；希望双击操作时使用图形界面版本。
 
-对于 `dt = 0.0005 s`、2000 个时间步的频率流程，频率分辨率为 1 Hz，
-奈奎斯特频率上限为 1000 Hz，可按下面命令提取：
+对于 `dt = 0.0005 s`、2000 个时间步的频率流程，频率分辨率为 1 Hz，奈奎斯特频率上限为 1000 Hz，可按下面命令提取：
 
 ```powershell
 .\dist\extract_cgns_pressure_cli.exe "data\*.cgns" `
@@ -33,7 +32,7 @@ pip install pyinstaller
   --export-all-data
 ```
 
-映射完整的 1-800 Hz 频率范围（4 线程并行）：
+映射完整的 1-800 Hz 频率范围，4 线程并行：
 
 ```powershell
 .\dist\map_cgns_pressure_to_inp_cli.exe `
@@ -46,8 +45,19 @@ pip install pyinstaller
   --num-workers 4
 ```
 
-``--num-workers 0`` 可自动根据 CPU 核心数选择线程数；默认 ``1`` 为串行。
+`--num-workers 0` 可自动根据 CPU 核心数选择线程数；默认 `1` 为串行。
 
-建议使用新的虚拟环境打包。`.[speed]` 额外依赖会安装 SciPy，使 PyInstaller
-能够一并打包 cKDTree 加速路径。PyInstaller 也会从打包机器上收集 Python、
-NumPy、h5py 和 Tkinter。
+需要把连续频率自动拆成多个 INP 时，加：
+
+```powershell
+  --frequency-group-mode groups `
+  --frequency-group-value 8
+```
+
+`groups` 表示一共分成多少个 INP；`bandwidth` 表示每个 INP 的 Hz 带宽。
+
+建议使用新的虚拟环境打包。`.[speed]` 额外依赖会安装 SciPy，使 PyInstaller 能一并打包 cKDTree 加速路径。PyInstaller 也会从打包机器上收集 Python、NumPy、h5py 和 Tkinter。
+
+`.\packaging\build_exe.ps1 -Clean` 只会列出建议手动清理的 `build/`、`dist/` 和 `.spec` 文件，不会自动删除文件或目录。
+
+.\packaging\build_exe.ps1
