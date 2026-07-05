@@ -92,6 +92,7 @@ def run_gui() -> int:
         tuple[int, int, int],
         tuple[float, float, float],
     ]:
+        """读取并校验坐标变换输入。"""
         try:
             scale = float(scale_var.get().strip() or "1.0")
         except ValueError as exc:
@@ -104,6 +105,7 @@ def run_gui() -> int:
         )
 
     def read_relative_zero_tolerance() -> float:
+        """读取节点力近零过滤阈值，空值使用 GUI 默认值。"""
         try:
             relative_zero_tolerance = float(relative_zero_tolerance_var.get().strip() or "1e-6")
         except ValueError as exc:
@@ -113,6 +115,7 @@ def run_gui() -> int:
         return relative_zero_tolerance
 
     def read_frequency_grouping() -> tuple[str, float | None]:
+        """读取频率输出分组设置。"""
         mode = frequency_group_mode_var.get().strip() or "none"
         if mode == "none":
             return mode, None
@@ -123,6 +126,7 @@ def run_gui() -> int:
         return mode, value
 
     def sample_points(points: np.ndarray, limit: int = 5000) -> np.ndarray:
+        """限制预览散点数量，避免 Tkinter 画布卡顿。"""
         values = np.asarray(points, dtype=float)
         if values.shape[0] <= limit:
             return values
@@ -139,6 +143,7 @@ def run_gui() -> int:
         width: int,
         height: int,
     ) -> None:
+        """在画布指定区域绘制一个二维投影预览。"""
         padding = 28
         plot_left = origin_x + padding
         plot_top = origin_y + padding
@@ -160,6 +165,7 @@ def run_gui() -> int:
             y_max += 0.5
 
         def map_point(point: np.ndarray) -> tuple[float, float]:
+            """把三维点的指定两轴映射到画布坐标。"""
             x_value = float(point[x_axis])
             y_value = float(point[y_axis])
             x = plot_left + (x_value - x_min) / (x_max - x_min) * (plot_right - plot_left)
@@ -180,6 +186,7 @@ def run_gui() -> int:
             canvas.create_line(x, y - 3, x, y + 3, fill="#202020")
 
     def show_alignment_window(preview: AlignmentPreview) -> None:
+        """打开坐标对齐预览窗口。"""
         window = tk.Toplevel(root)
         window.title("CGNS / INP 坐标对齐预览")
         window.geometry("1000x760")
@@ -210,6 +217,7 @@ def run_gui() -> int:
         draw_projection(canvas, preview, "YZ", (1, 2), 648, 8, 320, 620)
 
     def browse_inp() -> None:
+        """选择源 INP，并在未指定输出时填入默认映射路径。"""
         path = filedialog.askopenfilename(
             title="选择 Abaqus INP 文件",
             filetypes=[("Abaqus INP 文件", "*.inp"), ("所有文件", "*.*")],
@@ -221,11 +229,13 @@ def run_gui() -> int:
                 output_var.set(str(_default_output_path(input_path)))
 
     def browse_extracted() -> None:
+        """选择 CGNS 提取结果目录。"""
         path = filedialog.askdirectory(title="选择 CGNS 提取结果目录")
         if path:
             extracted_var.set(path)
 
     def browse_output() -> None:
+        """选择映射后 INP 的保存路径。"""
         path = filedialog.asksaveasfilename(
             title="保存映射后的 INP",
             defaultextension=".inp",
@@ -235,6 +245,7 @@ def run_gui() -> int:
             output_var.set(path)
 
     def update_progress(event: dict[str, object]) -> None:
+        """把 run_mapping 的进度事件同步到 GUI 控件。"""
         current = float(event.get("current", 0) or 0)
         total = float(event.get("total", 0) or 0)
         progress_var.set(100.0 * current / total if total else 0.0)
@@ -242,6 +253,7 @@ def run_gui() -> int:
         root.update_idletasks()
 
     def run_job() -> None:
+        """校验 GUI 输入并执行一次映射任务。"""
         try:
             progress_var.set(0.0)
             progress_text_var.set("正在准备映射...")
@@ -287,6 +299,7 @@ def run_gui() -> int:
         messagebox.showinfo("完成", f"已写入：\n{output_text}")
 
     def preview_alignment() -> None:
+        """计算并显示 CGNS 与 INP 目标面的坐标对齐预览。"""
         try:
             validate_mapping_gui_inputs(
                 inp_var.get(),

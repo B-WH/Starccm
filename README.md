@@ -4,6 +4,57 @@
 
 命令行入口保留在仓库根目录的两个脚本中，核心实现位于 `starccm_pressure/` 包内，便于复用和测试。
 
+## 快速上手
+
+1. 安装依赖：
+
+```powershell
+pip install -r requirements.txt
+```
+
+2. 提取 STAR-CCM+ CGNS 压力数据：
+
+```powershell
+python extract_cgns_pressure.py
+```
+
+3. 映射到 Abaqus INP：
+
+```powershell
+python map_cgns_pressure_to_inp.py
+```
+
+映射前建议先在图形界面中点击 `预览坐标对齐`，确认 CGNS 表面和 Abaqus 受载区域重合。
+
+4. 在 Abaqus 中使用结果：
+
+提交生成的 `*_mapped.inp`，并保持同目录下的 `*_loads.inc` 不要移动或改名。`*_mapped.inp` 内已经包含 `*INCLUDE, INPUT=...`，Abaqus 会自动读取对应的载荷 include 文件。
+
+## 程序框架与处理逻辑
+
+目录职责：
+
+- `extract_cgns_pressure.py`、`map_cgns_pressure_to_inp.py`：仓库根目录的兼容入口，便于直接运行和旧脚本调用。
+- `starccm_pressure/extract_cgns_pressure.py`：读取 HDF5-CGNS，整理表面几何、压力时间序列、频谱和等效力输出。
+- `starccm_pressure/map_cgns_pressure_to_inp.py`：解析 Abaqus INP，选取目标 `Nset` / `Elset`，完成压力插值、节点力等效、守恒修正和 include 写入。
+- `starccm_pressure/mapping_gui.py`：映射图形界面，负责收集输入和展示进度，核心计算仍调用映射模块。
+- `starccm_pressure/optional_deps.py`：集中加载可选依赖；安装 `scipy` 时启用 cKDTree 加速，未安装时自动回退到 NumPy。
+- `tests/`：普通 Python 单元测试和文档/打包配置检查。
+- `packaging/`：Windows EXE 打包脚本和打包说明。
+
+主流程：
+
+```text
+STAR-CCM+ .cgns
+  -> extract_cgns_pressure.py
+  -> surface_geometry.npz + pressure_complex_spectrum.npz / pressure_time.json.gz
+  -> map_cgns_pressure_to_inp.py
+  -> *_mapped.inp + *_loads.inc + mapping_report.json
+  -> Abaqus 提交 *_mapped.inp
+```
+
+提取阶段只负责把 STAR-CCM+ 数据整理成可复用的中间文件；映射阶段只读取这些中间文件和 Abaqus INP，不再直接读取 CGNS。GUI 和命令行共用同一套核心函数，因此两种入口的计算逻辑一致。
+
 ## 工具说明
 
 ### `extract_cgns_pressure.py`

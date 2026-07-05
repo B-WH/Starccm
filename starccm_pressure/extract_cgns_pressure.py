@@ -221,7 +221,7 @@ def _load_h5py() -> Any:
 
 
 def _natural_sort_key(text: str) -> tuple[object, ...]:
-    """Build a natural-sort key so embedded numbers sort by numeric value."""
+    """构造自然排序键，使文件名中的数字按数值排序。"""
     parts = re.split(r"(\d+)", text)
     return tuple(
         int(part) if part.isdigit() else part.casefold()
@@ -230,7 +230,7 @@ def _natural_sort_key(text: str) -> tuple[object, ...]:
 
 
 def sort_time_step_paths(paths: Iterable[str | Path]) -> list[Path]:
-    """Sort CGNS time-step paths by filename using natural numeric ordering."""
+    """按文件名自然排序 CGNS 时间步路径。"""
     return sorted(
         [Path(path) for path in paths],
         key=lambda path: _natural_sort_key(path.name),
@@ -238,7 +238,7 @@ def sort_time_step_paths(paths: Iterable[str | Path]) -> list[Path]:
 
 
 def build_input_file_order_message(file_paths: Iterable[str | Path]) -> str:
-    """Build a concise GUI message showing the resolved time-step file order."""
+    """生成展示时间步文件顺序的简短 GUI 消息。"""
     paths = sort_time_step_paths(file_paths)
     if not paths:
         return "未识别到 CGNS 文件。"
@@ -294,7 +294,7 @@ def _iter_datasets(node: Any, path: str = ""):
         path: 当前累积路径。
 
     Yields:
-        (dataset_path, dataset_object)。
+        返回 ``(dataset_path, dataset_object)``。
     """
     if hasattr(node, "items"):
         for name, child in node.items():
@@ -348,7 +348,7 @@ def _find_pressure_dataset(root: Any, pressure_name: str | None) -> tuple[str, A
         pressure_name: 目标压力数据集名称（可为 None）。
 
     Returns:
-        (dataset_path, dataset_object)。
+        返回 ``(dataset_path, dataset_object)``。
 
     Raises:
         ValueError: 未找到匹配的压力数据集。
@@ -486,7 +486,7 @@ def _pressure_vector_slice(
         end: 通道结束索引。
 
     Returns:
-        (sliced_vector, total_channel_count)。
+        返回 ``(sliced_vector, total_channel_count)``。
 
     Raises:
         ValueError: 切片越界或结果不符合预期。
@@ -617,7 +617,7 @@ def parse_mixed_tri3_faces(connectivity: np.ndarray, element_range: np.ndarray) 
 
     Args:
         connectivity: ElementConnectivity 一维数组。
-        element_range: ElementRange [start, end]。
+        element_range: CGNS 的 ElementRange [start, end]。
 
     Returns:
         (N_faces, 3) 的 0-based 顶点索引数组。
@@ -961,7 +961,7 @@ def _read_pressure_vector_from_file(
     """从单个文件读取完整压力向量。
 
     Returns:
-        (dataset_path, vector)。
+        返回 ``(dataset_path, vector)``。
     """
     with h5.File(file_path, "r") as root:
         if selected_dataset_path is None:
@@ -987,7 +987,7 @@ def _read_pressure_vector_slice_from_file(
     """从单个文件读取压力向量切片。
 
     Returns:
-        (dataset_path, sliced_vector, channel_count)。
+        返回 ``(dataset_path, sliced_vector, channel_count)``。
     """
     with h5.File(file_path, "r") as root:
         if selected_dataset_path is None:
@@ -1094,7 +1094,7 @@ def _compute_pressure_spectrum_components(
     """计算压力谱的六个分量，用于 JSON 有效载荷。
 
     Returns:
-        (frequencies, amplitudes, phases_rad, phases_deg, real_parts, imaginary_parts)。
+        返回频率、幅值、相位、实部和虚部等谱分量。
     """
     spectrum = compute_pressure_complex_spectrum(
         pressures,
@@ -1601,7 +1601,7 @@ def build_json_payloads(
         include_dc: 是否保留 DC。
 
     Returns:
-        (time_payload, spectrum_payload, average_payload)。
+        返回时间、频谱和空间平均三个 JSON 有效载荷。
     """
     pulsating_pressure, times, metadata, node_ids, coordinates = _payload_common_parts(
         series, dt, include_dc,
@@ -1699,7 +1699,7 @@ def write_surface_geometry_npz(path: str | Path, geometry: SurfaceGeometry) -> N
 
 
 def validate_cached_surface_geometry(geometry: SurfaceGeometry) -> None:
-    """Validate cached geometry arrays before they are reused."""
+    """复用缓存前校验几何数组的完整性。"""
     coordinates = np.asarray(geometry.coordinates, dtype=float)
     faces = np.asarray(geometry.faces, dtype=int)
     centers = np.asarray(geometry.centers, dtype=float)
@@ -1824,7 +1824,7 @@ def write_equivalent_force_spectrum_csv(
 
 
 def build_sampling_quality_metadata(sample_count: int, dt: float) -> dict[str, float | int]:
-    """Build sampling metadata used to judge FFT resolution and valid frequency range."""
+    """生成用于判断 FFT 分辨率和有效频率范围的采样元数据。"""
     if sample_count <= 0:
         raise ValueError("sample_count must be positive.")
     if dt <= 0.0:
@@ -2132,7 +2132,7 @@ def write_outputs(
     return time_json, spectrum_json, average_json
 
 
-# === CLI / GUI ===
+# === 命令行 / 图形界面 ===
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2319,7 +2319,7 @@ def build_streaming_success_message(
 
 
 def gui_default_export_options() -> dict[str, bool]:
-    """Return GUI defaults optimized for lightweight hand-off usage."""
+    """返回面向轻量交付流程优化的 GUI 默认导出选项。"""
     return {
         "skip_legacy_json": True,
         "export_complex_spectrum": False,
@@ -2455,6 +2455,7 @@ def run_gui() -> int:
     main_frame.columnconfigure(1, weight=1)
 
     def browse_input() -> None:
+        """选择一个或多个 CGNS 时间步文件。"""
         files = filedialog.askopenfilenames(
             title="选择 CGNS 文件",
             filetypes=[("CGNS 文件", "*.cgns"), ("所有文件", "*.*")],
@@ -2463,11 +2464,13 @@ def run_gui() -> int:
             input_var.set(";".join(files))
 
     def browse_output() -> None:
+        """选择提取结果输出目录。"""
         directory = filedialog.askdirectory(title="选择输出目录")
         if directory:
             output_var.set(directory)
 
     def browse_surface_geometry_cache() -> None:
+        """选择可复用的 surface_geometry.npz 缓存文件。"""
         file_path = filedialog.askopenfilename(
             title="选择表面几何缓存",
             filetypes=[("NPZ 文件", "*.npz"), ("所有文件", "*.*")],
@@ -2476,6 +2479,7 @@ def run_gui() -> int:
             surface_geometry_cache_var.set(file_path)
 
     def clear_surface_geometry_cache() -> None:
+        """清空表面几何缓存路径。"""
         surface_geometry_cache_var.set("")
 
     def set_running(is_running: bool) -> None:
@@ -2526,6 +2530,7 @@ def run_gui() -> int:
         )
 
     def finish_success(message: str) -> None:
+        """在主线程展示提取成功状态。"""
         progress_var.set(100.0)
         progress_text_var.set("已完成。")
         status_var.set(message)
@@ -2533,18 +2538,21 @@ def run_gui() -> int:
         messagebox.showinfo("完成", message)
 
     def finish_error(message: str) -> None:
+        """在主线程展示提取失败状态。"""
         progress_text_var.set("")
         status_var.set(f"错误：{message}")
         set_running(False)
         messagebox.showerror("提取失败", message)
 
     def finish_cancelled() -> None:
+        """在主线程展示用户取消状态。"""
         progress_text_var.set("已取消。")
         status_var.set("已取消。")
         set_running(False)
         messagebox.showinfo("已取消", "操作已取消。")
 
     def cancel_extraction() -> None:
+        """通知后台提取任务尽快取消。"""
         cancel_event.set()
         status_var.set("正在取消...")
         progress_text_var.set("正在取消...")
@@ -2564,6 +2572,7 @@ def run_gui() -> int:
         progress_text_var.set(str(event.get("message", "")))
 
     def report_progress(event: ProgressEvent) -> None:
+        """把后台线程进度安全转发到 Tkinter 主线程。"""
         root.after(0, update_progress, event)
 
     def run_extraction() -> None:
@@ -2596,6 +2605,7 @@ def run_gui() -> int:
         )
 
         def worker() -> None:
+            """在线程中运行耗时提取任务，避免阻塞界面。"""
             try:
                 message = run_gui_extraction_job(
                     raw_inputs, dt=dt, output_dir=output_dir,
@@ -2620,7 +2630,7 @@ def run_gui() -> int:
         threading.Thread(target=worker, daemon=True).start()
 
     # --- GUI 布局 ---
-    # Rows of label, entry, button widgets
+    # 标签、输入框和按钮按行排列。
     ttk.Label(main_frame, text="CGNS 文件或匹配模式").grid(row=0, column=0, sticky="w", pady=6)
     ttk.Entry(main_frame, textvariable=input_var, width=70).grid(row=0, column=1, sticky="ew", pady=6)
     input_button = ttk.Button(main_frame, text="选择文件", command=browse_input)
