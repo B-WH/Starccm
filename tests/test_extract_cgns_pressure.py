@@ -19,6 +19,9 @@ from extract_cgns_pressure import (
 )
 
 
+TEST_OUTPUT_DIR = Path("work/test-output")
+
+
 def _unlink_test_file(path: Path) -> None:
     """Best-effort cleanup for one explicit test artifact on Windows."""
     for _ in range(5):
@@ -31,6 +34,13 @@ def _unlink_test_file(path: Path) -> None:
 
 
 class ExtractCgnsPressureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        TEST_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        _unlink_test_file(TEST_OUTPUT_DIR / "surface_geometry_cache_test.npz")
+        _unlink_test_file(TEST_OUTPUT_DIR / "invalid_surface_geometry_cache_test.npz")
+
     def test_sort_time_step_paths_orders_embedded_numbers_naturally(self) -> None:
         paths = [
             Path("604@10.cgns"),
@@ -85,7 +95,7 @@ class ExtractCgnsPressureTests(unittest.TestCase):
         self.assertAlmostEqual(metadata["nyquist_hz"], 2.0)
 
     def test_surface_geometry_cache_writes_summary_metadata(self) -> None:
-        cache_path = Path("surface_geometry_cache_test.npz")
+        cache_path = TEST_OUTPUT_DIR / "surface_geometry_cache_test.npz"
         geometry = compute_triangle_surface_geometry(
             np.array(
                 [
@@ -112,7 +122,7 @@ class ExtractCgnsPressureTests(unittest.TestCase):
                 _unlink_test_file(cache_path)
 
     def test_load_surface_geometry_cache_rejects_out_of_range_faces(self) -> None:
-        cache_path = Path("invalid_surface_geometry_cache_test.npz")
+        cache_path = TEST_OUTPUT_DIR / "invalid_surface_geometry_cache_test.npz"
         try:
             np.savez_compressed(
                 cache_path,

@@ -1,4 +1,4 @@
-"""Compatibility entry point for STAR-CCM+ CGNS pressure extraction."""
+"""STAR-CCM+ CGNS 压力提取工具的兼容入口。"""
 
 if __name__ == "__main__":
     from starccm_pressure.extract_cgns_pressure import main

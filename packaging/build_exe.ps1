@@ -9,14 +9,14 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 if ($Clean) {
-    if (Test-Path -LiteralPath "build") {
-        Write-Host "Clean requested. Delete the build directory manually if needed."
-        exit 1
-    }
-    if (Test-Path -LiteralPath "dist") {
-        Write-Host "Clean requested. Delete the dist directory manually if needed."
-        exit 1
-    }
+    Write-Host "Clean requested. This script does not delete files automatically."
+    Write-Host "Manual cleanup targets, if present:"
+    Write-Host "  build\"
+    Write-Host "  dist\"
+    Write-Host "  extract_cgns_pressure_cli.spec"
+    Write-Host "  extract_cgns_pressure_gui.spec"
+    Write-Host "  map_cgns_pressure_to_inp_cli.spec"
+    Write-Host "  map_cgns_pressure_to_inp_gui.spec"
 }
 
 python -B -m PyInstaller `
