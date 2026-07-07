@@ -1,3 +1,4 @@
+#.\packaging\build_exe.ps1
 param(
     [switch]$Clean
 )
