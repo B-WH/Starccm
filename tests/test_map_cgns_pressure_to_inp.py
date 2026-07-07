@@ -10,6 +10,7 @@ import numpy as np
 
 from map_cgns_pressure_to_inp import (
     FileSizeLimitError,
+    _format_float,
     apply_global_conservation_correction,
     apply_coordinate_transform,
     _split_frequency_groups,
@@ -420,6 +421,9 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         self.assertIn("** Imaginary part", text)
         self.assertIn("2, 1, 10", text)
         self.assertIn("2, 3, -20", text)
+
+    def test_float_output_uses_eight_significant_digits(self) -> None:
+        self.assertEqual(_format_float(123.456789123), "123.45679")
 
     def test_preprint_echo_is_forced_off_before_step(self) -> None:
         lines = [
@@ -1192,6 +1196,38 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         self.assertEqual(stats["global_max_abs_force"], 0.0)
         self.assertEqual(stats["active_cload_count"], 0)
 
+    def test_frequency_table_writer_does_not_allocate_dense_force_matrix(
+        self,
+    ) -> None:
+        from starccm_pressure import map_cgns_pressure_to_inp as mapper
+
+        original_zeros = mapper.np.zeros
+
+        def guard_dense_matrix(shape, *args, **kwargs):
+            if shape == (2, 2, 3):
+                raise AssertionError("dense frequency-node-component matrix allocated")
+            return original_zeros(shape, *args, **kwargs)
+
+        node_force_maps: list[dict[int, np.ndarray]] = [
+            {
+                1: np.array([1.0 + 0.5j, 0.0 + 0.0j, -2.0 + 0.0j]),
+                2: np.array([0.25 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]),
+            },
+            {
+                1: np.array([1.5 + 0.25j, 0.0 + 0.0j, -3.0 + 0.0j]),
+                2: np.array([0.5 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]),
+            },
+        ]
+
+        with patch.object(mapper.np, "zeros", side_effect=guard_dense_matrix):
+            stats = write_frequency_table_load_include(
+                _test_path("map_test_model_mapped_loads.inc"),
+                node_force_maps,
+                [100.0, 200.0],
+            )
+
+        self.assertEqual(stats["frequency_count"], 2)
+
     def test_frequency_table_output_stats_in_mapping_report(self) -> None:
         inp_path = _test_path("map_test_model.inp")
         output_path = _test_path("map_test_model_mapped.inp")
@@ -1500,6 +1536,85 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
             [group["frequency_count"] for group in report["frequency_groups"]],
             [2, 2],
         )
+
+    def test_grouped_frequency_mapping_writes_each_group_before_next_group_maps(
+        self,
+    ) -> None:
+        from starccm_pressure import map_cgns_pressure_to_inp as mapper
+
+        inp_path = _test_path("map_test_model.inp")
+        output_path = _test_path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step, name=HARMONIC",
+                    "*Steady State Dynamics",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            _test_path("map_test_surface_geometry.npz"),
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        np.savez_compressed(
+            _test_path("map_test_pressure_complex_spectrum.npz"),
+            frequencies_hz=np.array([100.0, 200.0, 300.0, 400.0], dtype=float),
+            pressure_real=np.array([[8.0], [2.0], [3.0], [4.0]], dtype=float),
+            pressure_imag=np.array([[6.0], [1.0], [0.5], [0.25]], dtype=float),
+        )
+
+        events: list[str] = []
+        original_write = mapper.write_frequency_table_load_include
+
+        def fake_map_batch(*args, **kwargs):
+            source_pressures = args[4]
+            events.append("map")
+            return (
+                [
+                    {1: np.array([1.0 + 0.0j, 0.0 + 0.0j, -1.0 + 0.0j])}
+                    for _ in range(source_pressures.shape[0])
+                ],
+                [{} for _ in range(source_pressures.shape[0])],
+            )
+
+        def record_write(*args, **kwargs):
+            events.append("write")
+            return original_write(*args, **kwargs)
+
+        with patch.object(
+            mapper,
+            "_map_complex_pressure_batch_to_nodes",
+            side_effect=fake_map_batch,
+        ), patch.object(
+            mapper,
+            "write_frequency_table_load_include",
+            side_effect=record_write,
+        ):
+            run_mapping(
+                inp_path=inp_path,
+                extracted_dir=TEST_OUTPUT_DIR,
+                target_set="SURF",
+                target_set_type="elset",
+                frequencies=[100.0, 200.0, 300.0, 400.0],
+                output_path=output_path,
+                surface_geometry_name="map_test_surface_geometry.npz",
+                complex_spectrum_name="map_test_pressure_complex_spectrum.npz",
+                frequency_batch_size=2,
+                frequency_group_mode="groups",
+                frequency_group_value=2,
+            )
+
+        self.assertEqual(events[:3], ["map", "write", "map"])
 
     def test_multi_frequency_only_creates_one_include_with_amplitudes(
         self,

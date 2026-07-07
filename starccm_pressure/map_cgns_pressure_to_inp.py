@@ -15,11 +15,9 @@ CGNS 文件。稳态动力学使用 `surface_geometry.npz` 和
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import gzip
 import json
 import math
-import os
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -1500,7 +1498,7 @@ def _format_float(value: float) -> str:
     """用紧凑格式写出 Abaqus 输入文件中的浮点数。"""
     if value == 0.0:
         return "0"
-    return f"{value:.12g}"
+    return f"{value:.8g}"
 
 
 def write_frequency_load_include(
@@ -1579,24 +1577,17 @@ def write_frequency_table_load_include(
 
     n_freqs = len(frequencies_hz)
 
-    # ── 构建稠密力矩阵 (n_freqs, n_nodes, 3) ──────────────────────
+    # 只保留当前节点/方向的短序列，避免重复构建完整力矩阵。
     all_node_ids = sorted(
         {node_id for node_forces in node_force_maps for node_id in node_forces}
     )
-    n_nodes = len(all_node_ids)
-    node_index_map = {node_id: idx for idx, node_id in enumerate(all_node_ids)}
-
-    forces_matrix = np.zeros((n_freqs, n_nodes, 3), dtype=complex)
-    for freq_idx, node_forces in enumerate(node_force_maps):
-        for node_id, force in node_forces.items():
-            forces_matrix[freq_idx, node_index_map[node_id]] = np.asarray(
-                force, dtype=complex
-            )
+    global_max_abs_force = 0.0
+    for node_forces in node_force_maps:
+        for force in node_forces.values():
+            force_max = float(np.max(np.abs(np.asarray(force, dtype=complex))))
+            global_max_abs_force = max(global_max_abs_force, force_max)
 
     # ── 全局最大力幅值 ────────────────────────────────────────────
-    global_max_abs_force = (
-        float(np.max(np.abs(forces_matrix))) if forces_matrix.size > 0 else 0.0
-    )
     threshold = global_max_abs_force * float(relative_zero_tolerance)
 
     # ── 预格式化频率字符串，避免循环内重复转换 ─────────────────
@@ -1614,13 +1605,18 @@ def write_frequency_table_load_include(
             fh.write("** No nonzero steady-state loads were generated.\n")
         else:
             for node_id in all_node_ids:
-                node_idx = node_index_map[node_id]
                 for component in range(3):
-                    real_series = np.real(forces_matrix[:, node_idx, component])
-                    imag_series = np.imag(forces_matrix[:, node_idx, component])
+                    component_series = [
+                        complex(np.asarray(node_forces[node_id], dtype=complex)[component])
+                        if node_id in node_forces
+                        else 0.0 + 0.0j
+                        for node_forces in node_force_maps
+                    ]
+                    real_series = [float(value.real) for value in component_series]
+                    imag_series = [float(value.imag) for value in component_series]
 
-                    real_max = float(np.max(np.abs(real_series)))
-                    imag_max = float(np.max(np.abs(imag_series)))
+                    real_max = max((abs(value) for value in real_series), default=0.0)
+                    imag_max = max((abs(value) for value in imag_series), default=0.0)
 
                     if real_max > threshold:
                         amp_name = f"CGNS_R_N{node_id}_D{component + 1}"
@@ -2428,6 +2424,15 @@ def run_mapping(
             raise ValueError(
                 "Streamed frequency mapping requires requested frequencies in ascending order."
             )
+        mapped_frequencies = [
+            float(extracted_frequencies[spectrum_index])
+            for spectrum_index in spectrum_indices
+        ]
+        group_ranges = _split_frequency_groups(
+            mapped_frequencies,
+            frequency_group_mode,
+            frequency_group_value,
+        )
 
         # ── 频率分块 ────────────────────────────────────
         if frequency_batch_size is not None and frequency_batch_size > 0:
@@ -2439,7 +2444,13 @@ def run_mapping(
                 n_scatter=consistent_force_plan.indices.shape[0] * 4,
                 memory_limit_mb=512.0,
             )
-        batch_count = max(1, (len(spectrum_indices) + batch_size - 1) // batch_size)
+        batch_count = max(
+            1,
+            sum(
+                (end - start + batch_size - 1) // batch_size
+                for start, end in group_ranges
+            ),
+        )
         progress_total = batch_count + 4
         _report_mapping_progress(
             progress_callback,
@@ -2454,29 +2465,25 @@ def run_mapping(
             "积分方案已构建",
         )
 
-        # ── 解析并行度 ─────────────────────────────────
-        workers = int(num_workers)
-        if workers == 0:
-            workers = min(32, (getattr(os, "cpu_count", lambda: 4)() or 4) + 4)
-        # ponytail: 压缩 npz 行流式读取是顺序的；若性能分析显示 CPU
-        # 而不是 IO 成为瓶颈，再加有界预取。
-        use_parallel = False
-
         if show_progress and batch_count > 1:
-            if use_parallel:
-                print(f"  频率分块: 每块 {batch_size} 个频率, 共 {batch_count} 块 "
-                      f"(共 {len(spectrum_indices)} 个频率, {workers} 线程并行)")
-            else:
-                print(f"  频率分块: 每块 {batch_size} 个频率, 共 {batch_count} 块 "
-                      f"(共 {len(spectrum_indices)} 个频率)")
+            print(f"  频率分块: 每块 {batch_size} 个频率, 共 {batch_count} 块 "
+                  f"(共 {len(spectrum_indices)} 个频率)")
 
-        # 预计算所有批次的切片
-        batch_specs: list[tuple[int, np.ndarray]] = []
-        for batch_start in range(0, len(spectrum_indices), batch_size):
-            batch_end = min(batch_start + batch_size, len(spectrum_indices))
-            batch_specs.append(
-                (batch_start, np.asarray(spectrum_indices[batch_start:batch_end], dtype=int))
-            )
+        # 按输出组生成批次切片，避免先攒完整频带的节点力。
+        def _group_batch_specs(start: int, end: int) -> list[tuple[int, np.ndarray]]:
+            specs: list[tuple[int, np.ndarray]] = []
+            for batch_start in range(start, end, batch_size):
+                batch_end = min(batch_start + batch_size, end)
+                specs.append(
+                    (
+                        batch_start,
+                        np.asarray(
+                            spectrum_indices[batch_start:batch_end],
+                            dtype=int,
+                        ),
+                    )
+                )
+            return specs
 
         # 单个批次的工作函数（闭包捕获只读共享数据，线程安全）
         def _process_batch(spec: tuple[int, np.ndarray]) -> tuple[
@@ -2496,122 +2503,100 @@ def run_mapping(
                 consistent_force_plan=consistent_force_plan,
             )
 
-        all_force_maps: list[dict[int, np.ndarray]] = []
-        all_batch_stats: list[dict[str, float | int]] = []
+        per_frequency_stats: list[dict[str, Any]] = []
+        frequency_groups: list[dict[str, Any]] = []
+        processed_batch_count = 0
+        try:
+            for group_number, (start, end) in enumerate(group_ranges, start=1):
+                group_frequencies = mapped_frequencies[start:end]
+                group_force_maps: list[dict[int, np.ndarray]] = []
+                group_batch_stats: list[dict[str, float | int]] = []
 
-        if use_parallel:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                # 按顺序提交，future 列表索引即批次顺序
-                futures = [
-                    executor.submit(_process_batch, spec) for spec in batch_specs
-                ]
-                for idx, future in enumerate(futures):
-                    # 按提交顺序等待结果，保证频率顺序不变
-                    batch_force_maps, batch_chunk_stats = future.result()
-                    all_force_maps.extend(batch_force_maps)
-                    all_batch_stats.extend(batch_chunk_stats)
+                for spec in _group_batch_specs(start, end):
+                    next_batch_number = processed_batch_count + 1
+                    if show_progress and batch_count > 1:
+                        print(
+                            f"  处理频率块 {next_batch_number}/{batch_count} "
+                            f"({len(spec[1])} 个频率)..."
+                        )
+                    batch_force_maps, batch_chunk_stats = _process_batch(spec)
+                    if show_progress and batch_count > 1:
+                        print("    完成")
+                    group_force_maps.extend(batch_force_maps)
+                    group_batch_stats.extend(batch_chunk_stats)
+                    processed_batch_count = next_batch_number
                     _report_mapping_progress(
                         progress_callback,
-                        idx + 3,
+                        processed_batch_count + 2,
                         progress_total,
-                        f"频率块 {idx + 1}/{batch_count}",
+                        f"频率块 {processed_batch_count}/{batch_count}",
                     )
-                    if show_progress:
-                        print(f"  频率块 {idx + 1}/{batch_count} 完成")
-        else:
-            for batch_idx, spec in enumerate(batch_specs):
-                if show_progress and batch_count > 1:
-                    print(f"  处理频率块 {batch_idx + 1}/{batch_count} "
-                          f"({len(spec[1])} 个频率)...")
-                batch_force_maps, batch_chunk_stats = _process_batch(spec)
-                if show_progress and batch_count > 1:
-                    print("    完成")
-                all_force_maps.extend(batch_force_maps)
-                all_batch_stats.extend(batch_chunk_stats)
-                _report_mapping_progress(
-                    progress_callback,
-                    batch_idx + 3,
-                    progress_total,
-                    f"频率块 {batch_idx + 1}/{batch_count}",
-                )
 
-        node_force_maps = all_force_maps
-        batch_stats = all_batch_stats
-        spectrum_reader.close()
-
-        per_frequency_stats: list[dict[str, Any]] = []
-        mapped_frequencies: list[float] = []
-        for requested_frequency, spectrum_index, node_forces, stats in zip(
-            frequencies,
-            spectrum_indices,
-            node_force_maps,
-            batch_stats,
-        ):
-            mapped_frequency = float(extracted_frequencies[spectrum_index])
-            mapped_frequencies.append(mapped_frequency)
-            per_frequency_stats.append(
-                {
-                    "requested_frequency_hz": float(requested_frequency),
-                    "mapped_frequency_hz": mapped_frequency,
-                    **stats,
-                }
-            )
-        group_ranges = _split_frequency_groups(
-            mapped_frequencies,
-            frequency_group_mode,
-            frequency_group_value,
-        )
-        if show_progress:
-            n_nodes = len(set(nid for nf in node_force_maps for nid in nf))
-            print(f"写出载荷 include ({len(node_force_maps)} 个频率, "
-                  f"{n_nodes} 个受载节点)...")
-        frequency_groups: list[dict[str, Any]] = []
-        for group_number, (start, end) in enumerate(group_ranges, start=1):
-            group_frequencies = mapped_frequencies[start:end]
-            group_force_maps = node_force_maps[start:end]
-            group_output = (
-                output
-                if frequency_group_mode == "none"
-                else _grouped_output_path(output, group_number, group_frequencies)
-            )
-            include_path = group_output.with_name(f"{group_output.stem}_loads.inc")
-            if len(group_force_maps) == 1:
-                write_frequency_load_include(
-                    include_path,
-                    group_force_maps[0],
-                    frequency_hz=group_frequencies[0],
-                    node_label_prefix=node_label_prefix,
-                )
-                frequency_table_stats: dict[str, int | float] = {
-                    "frequency_count": 1,
-                    "load_table_count": 0,
-                    "active_cload_count": 0,
-                    "skipped_near_zero_components": 0,
-                    "global_max_abs_force": 0.0,
-                    "relative_zero_tolerance": float(relative_zero_tolerance),
-                }
-            else:
-                frequency_table_stats = write_frequency_table_load_include(
-                    include_path,
-                    group_force_maps,
+                for requested_frequency, mapped_frequency, stats in zip(
+                    frequencies[start:end],
                     group_frequencies,
-                    relative_zero_tolerance=relative_zero_tolerance,
-                    node_label_prefix=node_label_prefix,
+                    group_batch_stats,
+                ):
+                    per_frequency_stats.append(
+                        {
+                            "requested_frequency_hz": float(requested_frequency),
+                            "mapped_frequency_hz": float(mapped_frequency),
+                            **stats,
+                        }
+                    )
+
+                if show_progress:
+                    n_nodes = len(set(nid for nf in group_force_maps for nid in nf))
+                    print(
+                        f"写出载荷 include ({len(group_force_maps)} 个频率, "
+                        f"{n_nodes} 个受载节点)..."
+                    )
+
+                group_output = (
+                    output
+                    if frequency_group_mode == "none"
+                    else _grouped_output_path(output, group_number, group_frequencies)
                 )
-            include_paths.append(include_path)
-            output_paths.append(group_output)
-            frequency_groups.append(
-                {
-                    "group_index": group_number,
-                    "frequency_count": len(group_frequencies),
-                    "frequency_start_hz": group_frequencies[0],
-                    "frequency_end_hz": group_frequencies[-1],
-                    "frequencies_hz": group_frequencies,
-                    "output_inp": str(group_output),
-                    "include_file": str(include_path),
-                    "frequency_table_output": frequency_table_stats,
-                }
-            )
+                include_path = group_output.with_name(f"{group_output.stem}_loads.inc")
+                if len(group_force_maps) == 1:
+                    write_frequency_load_include(
+                        include_path,
+                        group_force_maps[0],
+                        frequency_hz=group_frequencies[0],
+                        node_label_prefix=node_label_prefix,
+                    )
+                    frequency_table_stats: dict[str, int | float] = {
+                        "frequency_count": 1,
+                        "load_table_count": 0,
+                        "active_cload_count": 0,
+                        "skipped_near_zero_components": 0,
+                        "global_max_abs_force": 0.0,
+                        "relative_zero_tolerance": float(relative_zero_tolerance),
+                    }
+                else:
+                    frequency_table_stats = write_frequency_table_load_include(
+                        include_path,
+                        group_force_maps,
+                        group_frequencies,
+                        relative_zero_tolerance=relative_zero_tolerance,
+                        node_label_prefix=node_label_prefix,
+                    )
+                include_paths.append(include_path)
+                output_paths.append(group_output)
+                frequency_groups.append(
+                    {
+                        "group_index": group_number,
+                        "frequency_count": len(group_frequencies),
+                        "frequency_start_hz": group_frequencies[0],
+                        "frequency_end_hz": group_frequencies[-1],
+                        "frequencies_hz": group_frequencies,
+                        "output_inp": str(group_output),
+                        "include_file": str(include_path),
+                        "frequency_table_output": frequency_table_stats,
+                    }
+                )
+        finally:
+            spectrum_reader.close()
         _report_mapping_progress(
             progress_callback,
             progress_total - 1,
