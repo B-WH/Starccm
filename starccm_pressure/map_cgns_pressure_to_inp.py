@@ -18,8 +18,10 @@ import argparse
 import gzip
 import json
 import math
+import os
 import sys
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
@@ -44,6 +46,16 @@ def _report_mapping_progress(
     """把映射进度统一转成 GUI/CLI 可消费的字典事件。"""
     if progress_callback is not None:
         progress_callback({"current": current, "total": total, "message": message})
+
+
+def _resolve_worker_count(num_workers: int) -> int:
+    """解析频率批次线程数；0 表示使用标准库默认上限策略。"""
+    workers = int(num_workers)
+    if workers < 0:
+        raise ValueError("num_workers 必须大于或等于 0。")
+    if workers == 0:
+        return min(32, (os.cpu_count() or 1) + 4)
+    return workers
 
 
 class FileSizeLimitError(ValueError):
@@ -252,7 +264,7 @@ def _parse_set_values(lines: list[str], start: int, generated: bool) -> tuple[se
         numbers = _parse_int_list(line)
         if generated:
             if len(numbers) != 3:
-                raise ValueError("Generated set rows must contain start, end, increment.")
+                raise ValueError("generate 集合行必须包含 start、end、increment 三个值。")
             values.update(range(numbers[0], numbers[1] + 1, numbers[2]))
         else:
             values.update(numbers)
@@ -306,7 +318,7 @@ def parse_inp_text(text: str) -> AbaqusModel:
             index += 1
             continue
         if lower.startswith("*include"):
-            raise ValueError("Nested *INCLUDE files are not supported in v1.")
+            raise ValueError("暂不支持嵌套 *INCLUDE 文件。")
         if not stripped.startswith("*"):
             index += 1
             continue
@@ -339,7 +351,7 @@ def parse_inp_text(text: str) -> AbaqusModel:
                 if row and not row.startswith("**"):
                     parts = [part.strip() for part in row.split(",")]
                     if len(parts) < 4:
-                        raise ValueError(f"Invalid *Node row: {row}")
+                        raise ValueError(f"无效的 *Node 行：{row}")
                     nodes[int(parts[0])] = np.array(
                         [float(parts[1]), float(parts[2]), float(parts[3])],
                         dtype=float,
@@ -355,7 +367,7 @@ def parse_inp_text(text: str) -> AbaqusModel:
             element_type = str(params.get("type", "")).upper()
             header_elset = str(params.get("elset", "")).strip()
             if not element_type:
-                raise ValueError("*Element keyword must include type=.")
+                raise ValueError("*Element 关键字必须包含 type=。")
             index += 1
             while index < len(lines) and not lines[index].lstrip().startswith("*"):
                 row = lines[index].strip()
@@ -380,7 +392,7 @@ def parse_inp_text(text: str) -> AbaqusModel:
             name_key = "nset" if keyword == "*nset" else "elset"
             set_name = str(params.get(name_key, "")).strip()
             if not set_name:
-                raise ValueError(f"{keyword} must include {name_key}=.")
+                raise ValueError(f"{keyword} 必须包含 {name_key}=。")
             generated = bool(params.get("generate", False))
             values, index = _parse_set_values(lines, index + 1, generated)
             target = nsets if keyword == "*nset" else elsets
@@ -489,7 +501,7 @@ def _element_face_node_ids(element: AbaqusElement) -> list[list[int]]:
             [nodes[2], nodes[6], nodes[7], nodes[3]],
             [nodes[3], nodes[7], nodes[4], nodes[0]],
         ]
-    raise ValueError(f"Unsupported element type for surface extraction: {element_type}")
+    raise ValueError(f"不支持从该单元类型提取表面：{element_type}")
 
 
 def _area_vector(points: np.ndarray) -> np.ndarray:
@@ -505,13 +517,13 @@ def _area_vector(points: np.ndarray) -> np.ndarray:
         ValueError: 节点数不足或面退化。
     """
     if points.shape[0] < 3:
-        raise ValueError("A face must contain at least three nodes.")
+        raise ValueError("面至少需要三个节点。")
     vector = np.zeros(3, dtype=float)
     origin = points[0]
     for index in range(1, points.shape[0] - 1):
         vector += 0.5 * np.cross(points[index] - origin, points[index + 1] - origin)
     if not np.all(np.isfinite(vector)) or np.linalg.norm(vector) == 0.0:
-        raise ValueError("Degenerate target face encountered.")
+        raise ValueError("遇到退化的目标面。")
     return vector
 
 
@@ -544,8 +556,8 @@ def _target_part_name(
     part_name = _lookup_case_insensitive(model.instance_parts, instance_name)
     if not part_name:
         raise ValueError(
-            f"Target {target_set_type} '{target_set}' references instance "
-            f"'{instance_name}', but the matching *Instance definition was not found."
+            f"目标 {target_set_type} '{target_set}' 引用了实例 "
+            f"'{instance_name}'，但找不到匹配的 *Instance 定义。"
         )
     return str(part_name)
 
@@ -581,20 +593,20 @@ def select_target_faces(
         elements = _lookup_case_insensitive(model.elements_by_part, part_name)
         if nodes is None or elements is None:
             raise ValueError(
-                f"Target {target_set_type} '{target_set}' references part "
-                f"'{part_name}', but that part's mesh was not parsed."
+                f"目标 {target_set_type} '{target_set}' 引用了 Part "
+                f"'{part_name}'，但未解析到该 Part 的网格。"
             )
 
     if target_set_type.lower() == "elset":
         if normalized_set not in model.elsets:
-            raise ValueError(f"Target elset '{target_set}' was not found.")
+            raise ValueError(f"找不到目标 elset '{target_set}'。")
         element_ids = model.elsets[normalized_set]
         face_counts: dict[tuple[int, ...], int] = {}
         candidate_faces: list[list[int]] = []
         for element_id in element_ids:
             element = elements.get(element_id)
             if element is None:
-                raise ValueError(f"Elset '{target_set}' references missing element {element_id}.")
+                raise ValueError(f"Elset '{target_set}' 引用了缺失的单元 {element_id}。")
             for face in _element_face_node_ids(element):
                 candidate_faces.append(face)
                 face_counts[tuple(sorted(face))] = face_counts.get(tuple(sorted(face)), 0) + 1
@@ -603,7 +615,7 @@ def select_target_faces(
                 selected_faces.append(face)
     elif target_set_type.lower() == "nset":
         if normalized_set not in model.nsets:
-            raise ValueError(f"Target nset '{target_set}' was not found.")
+            raise ValueError(f"找不到目标 nset '{target_set}'。")
         selected_nodes = model.nsets[normalized_set]
         # 建立节点到单元的反向索引，只检查至少引用一个目标节点的单元。
         # 若每次都扫描全模型，大型 INP 中的小受湿面会成为明显瓶颈。
@@ -620,10 +632,10 @@ def select_target_faces(
                 if all(node_id in selected_nodes for node_id in face):
                     selected_faces.append(face)
     else:
-        raise ValueError("target_set_type must be 'nset' or 'elset'.")
+        raise ValueError("target_set_type 必须是 'nset' 或 'elset'。")
 
     if not selected_faces:
-        raise ValueError(f"Target {target_set_type} '{target_set}' did not produce any faces.")
+        raise ValueError(f"目标 {target_set_type} '{target_set}' 没有生成任何受载面。")
 
     centers: list[np.ndarray] = []
     area_vectors: list[np.ndarray] = []
@@ -632,7 +644,7 @@ def select_target_faces(
         try:
             points = np.vstack([nodes[node_id] for node_id in face])
         except KeyError as exc:
-            raise ValueError(f"Face references missing node {exc.args[0]}.") from exc
+            raise ValueError(f"面引用了缺失的节点 {exc.args[0]}。") from exc
         face_points.append(points)
         centers.append(np.mean(points, axis=0))
         area_vectors.append(_area_vector(points))
@@ -668,9 +680,9 @@ def apply_coordinate_transform(
     """
     values = np.asarray(coordinates, dtype=float)
     if values.ndim != 2 or values.shape[1] != 3:
-        raise ValueError("coordinates must have shape (N, 3).")
+        raise ValueError("coordinates 必须为形状 (N, 3) 的数组。")
     if sorted(axis_order) != [0, 1, 2]:
-        raise ValueError("axis_order must be a permutation of 0, 1, 2.")
+        raise ValueError("axis_order 必须是 0、1、2 的排列。")
     transformed = values[:, axis_order] * np.asarray(axis_sign, dtype=float)
     transformed = transformed * float(scale)
     if translate is not None:
@@ -685,7 +697,7 @@ def _coordinate_transform_matrix(
 ) -> np.ndarray:
     """构造坐标轴重排、符号翻转和尺度缩放对应的线性矩阵。"""
     if sorted(axis_order) != [0, 1, 2]:
-        raise ValueError("axis_order must be a permutation of 0, 1, 2.")
+        raise ValueError("axis_order 必须是 0、1、2 的排列。")
     matrix = np.zeros((3, 3), dtype=float)
     for row, source_axis in enumerate(axis_order):
         matrix[row, source_axis] = float(axis_sign[row]) * float(scale)
@@ -701,7 +713,7 @@ def transform_area_vectors(
     """将 CGNS 有向面积矢量转换到 INP 坐标系。"""
     values = np.asarray(area_vectors, dtype=float)
     if values.ndim != 2 or values.shape[1] != 3:
-        raise ValueError("area_vectors must have shape (N, 3).")
+        raise ValueError("area_vectors 必须为形状 (N, 3) 的数组。")
     matrix = _coordinate_transform_matrix(
         scale=scale,
         axis_order=axis_order,
@@ -709,7 +721,7 @@ def transform_area_vectors(
     )
     determinant = float(np.linalg.det(matrix))
     if determinant == 0.0:
-        raise ValueError("scale must be non-zero for area vector transformation.")
+        raise ValueError("转换面积向量时 scale 不能为 0。")
     area_transform = determinant * np.linalg.inv(matrix).T
     return values @ area_transform.T
 
@@ -826,11 +838,11 @@ def _nearest_distances(source_points: np.ndarray, target_points: np.ndarray) -> 
     sources = np.asarray(source_points, dtype=float)
     targets = np.asarray(target_points, dtype=float)
     if sources.ndim != 2 or sources.shape[1] != 3:
-        raise ValueError("source_points must have shape (N, 3).")
+        raise ValueError("source_points 必须为形状 (N, 3) 的数组。")
     if targets.ndim != 2 or targets.shape[1] != 3:
-        raise ValueError("target_points must have shape (N, 3).")
+        raise ValueError("target_points 必须为形状 (N, 3) 的数组。")
     if sources.shape[0] == 0 or targets.shape[0] == 0:
-        raise ValueError("source_points and target_points must not be empty.")
+        raise ValueError("source_points 和 target_points 不能为空。")
 
     tree_type = _load_ckdtree()
     if tree_type is not None:
@@ -883,11 +895,11 @@ def interpolate_pressure_to_faces(
     source = np.asarray(source_centers, dtype=float)
     pressure = np.asarray(source_pressure)
     if target.ndim != 2 or target.shape[1] != 3:
-        raise ValueError("target_centers must have shape (N, 3).")
+        raise ValueError("target_centers 必须为形状 (N, 3) 的数组。")
     if source.ndim != 2 or source.shape[1] != 3:
-        raise ValueError("source_centers must have shape (N, 3).")
+        raise ValueError("source_centers 必须为形状 (N, 3) 的数组。")
     if source.shape[0] != pressure.shape[0]:
-        raise ValueError("source_pressure length must match source_centers.")
+        raise ValueError("source_pressure 的长度必须与 source_centers 匹配。")
     indices, weights = _nearest_weights(target, source, k)
     interpolated = np.sum(pressure[indices] * weights, axis=1)
     nearest_distances = np.linalg.norm(source[indices[:, 0]] - target, axis=1)
@@ -922,7 +934,7 @@ def pressure_faces_to_node_forces(
     pressures = np.asarray(face_pressures)
     area_vectors = np.asarray(target_area_vectors, dtype=float)
     if pressures.shape[0] != area_vectors.shape[0]:
-        raise ValueError("face_pressures and target_area_vectors must have matching rows.")
+        raise ValueError("face_pressures 和 target_area_vectors 的行数必须一致。")
     forces: dict[int, np.ndarray] = {}
     for face_index, nodes in enumerate(target_node_ids):
         face_force = -pressures[face_index] * area_vectors[face_index]
@@ -994,12 +1006,12 @@ def _quad4_quadrature(points: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, 
 def _face_quadrature(points: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """按面节点数选择 TRI3 或 QUAD4 积分规则。"""
     if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("target face points must have shape (N, 3).")
+        raise ValueError("目标面节点坐标必须为形状 (N, 3) 的数组。")
     if points.shape[0] == 3:
         return _tri3_quadrature(points)
     if points.shape[0] == 4:
         return _quad4_quadrature(points)
-    raise ValueError("Consistent nodal force integration supports only 3- or 4-node faces.")
+    raise ValueError("一致节点力积分只支持 3 节点或 4 节点面。")
 
 
 def pressure_faces_to_consistent_node_forces(
@@ -1031,7 +1043,7 @@ def build_consistent_force_plan(
 ) -> ConsistentForcePlan:
     """构建一致节点力映射所需的纯几何插值数据。"""
     if len(target_face_points) != len(target_node_ids):
-        raise ValueError("target_face_points length must match target_node_ids.")
+        raise ValueError("target_face_points 的长度必须与 target_node_ids 匹配。")
 
     integration_points: list[np.ndarray] = []
     plan_node_ids: list[int] = []
@@ -1043,7 +1055,7 @@ def build_consistent_force_plan(
     for points, node_ids in zip(target_face_points, target_node_ids):
         point_array = np.asarray(points, dtype=float)
         if point_array.shape[0] != len(node_ids):
-            raise ValueError("Each target face must have the same number of points and nodes.")
+            raise ValueError("每个目标面的坐标点数量必须与节点数量一致。")
         for shape, location, area_vector_weight in _face_quadrature(point_array):
             point_index = len(integration_points)
             integration_points.append(location)
@@ -1096,9 +1108,9 @@ def apply_consistent_force_plan_batch(
     """
     pressures = np.asarray(source_pressures)
     if pressures.ndim != 2:
-        raise ValueError("source_pressures must have shape (frequency_count, source_count).")
+        raise ValueError("source_pressures 必须为形状 (frequency_count, source_count) 的数组。")
     if pressures.shape[1] != plan.source_count:
-        raise ValueError("source_pressures second dimension must match source_centers.")
+        raise ValueError("source_pressures 的第二维必须与 source_centers 匹配。")
 
     # (n_freqs, n_integration_points)：把源面压力插值到每个目标面积分点。
     pressure_at_points = np.sum(
@@ -1137,7 +1149,7 @@ def apply_consistent_force_plan(
     """用预计算计划映射单个频率的复压力行。"""
     pressure = np.asarray(source_pressure)
     if pressure.shape[0] != plan.source_count:
-        raise ValueError("source_pressure length must match source_centers.")
+        raise ValueError("source_pressure 的长度必须与 source_centers 匹配。")
     force_array, node_ids, stats = apply_consistent_force_plan_batch(
         plan,
         pressure[np.newaxis, :],
@@ -1158,11 +1170,11 @@ def compute_face_force_moment(
     area_array = np.asarray(area_vectors, dtype=float)
     pressure_array = np.asarray(pressures)
     if center_array.ndim != 2 or center_array.shape[1] != 3:
-        raise ValueError("centers must have shape (N, 3).")
+        raise ValueError("centers 必须为形状 (N, 3) 的数组。")
     if area_array.shape != center_array.shape:
-        raise ValueError("area_vectors must have the same shape as centers.")
+        raise ValueError("area_vectors 的形状必须与 centers 一致。")
     if pressure_array.shape[0] != center_array.shape[0]:
-        raise ValueError("pressures length must match centers.")
+        raise ValueError("pressures 的长度必须与 centers 匹配。")
     face_forces = -pressure_array[:, np.newaxis] * area_array
     return (
         np.sum(face_forces, axis=0),
@@ -1180,13 +1192,13 @@ def _compute_face_force_moment_batch(
     area_array = np.asarray(area_vectors, dtype=float)
     pressure_array = np.asarray(pressures)
     if pressure_array.ndim != 2:
-        raise ValueError("pressures must have shape (frequency_count, source_count).")
+        raise ValueError("pressures 必须为形状 (frequency_count, source_count) 的数组。")
     if center_array.ndim != 2 or center_array.shape[1] != 3:
-        raise ValueError("centers must have shape (N, 3).")
+        raise ValueError("centers 必须为形状 (N, 3) 的数组。")
     if area_array.shape != center_array.shape:
-        raise ValueError("area_vectors must have the same shape as centers.")
+        raise ValueError("area_vectors 的形状必须与 centers 一致。")
     if pressure_array.shape[1] != center_array.shape[0]:
-        raise ValueError("pressures second dimension must match centers.")
+        raise ValueError("pressures 的第二维必须与 centers 匹配。")
     face_forces = -pressure_array[:, :, np.newaxis] * area_array[np.newaxis, :, :]
     return (
         np.sum(face_forces, axis=1),
@@ -1200,17 +1212,17 @@ def compute_node_force_moment(
 ) -> tuple[np.ndarray, np.ndarray]:
     """由节点集中力计算总力和总力矩。"""
     if not node_forces:
-        raise ValueError("node_forces must not be empty.")
+        raise ValueError("node_forces 不能为空。")
     dtype = np.result_type(*[np.asarray(force).dtype for force in node_forces.values()])
     total_force = np.zeros(3, dtype=dtype)
     total_moment = np.zeros(3, dtype=dtype)
     for node_id, force in node_forces.items():
         if node_id not in node_coordinates:
-            raise ValueError(f"Missing coordinates for node {node_id}.")
+            raise ValueError(f"缺少节点 {node_id} 的坐标。")
         force_array = np.asarray(force, dtype=dtype)
         coordinate = np.asarray(node_coordinates[node_id], dtype=float)
         if force_array.shape != (3,) or coordinate.shape != (3,):
-            raise ValueError("node force and coordinate entries must be length-3 vectors.")
+            raise ValueError("节点力和坐标条目都必须是长度为 3 的向量。")
         total_force += force_array
         total_moment += np.cross(coordinate, force_array)
     return total_force, total_moment
@@ -1235,15 +1247,15 @@ def _node_coordinates_from_faces(
 ) -> dict[int, np.ndarray]:
     """从目标面节点列表恢复节点编号到坐标的唯一映射。"""
     if len(target_node_ids) != len(target_face_points):
-        raise ValueError("target_node_ids and target_face_points must have matching lengths.")
+        raise ValueError("target_node_ids 和 target_face_points 的长度必须一致。")
     coordinates: dict[int, np.ndarray] = {}
     for node_ids, points in zip(target_node_ids, target_face_points):
         point_array = np.asarray(points, dtype=float)
         if point_array.shape[0] != len(node_ids) or point_array.shape[1] != 3:
-            raise ValueError("Each target face must have matching node ids and 3D points.")
+            raise ValueError("每个目标面的节点编号和三维坐标点必须匹配。")
         for node_id, coordinate in zip(node_ids, point_array):
             if node_id in coordinates and not np.allclose(coordinates[node_id], coordinate):
-                raise ValueError(f"Node {node_id} has inconsistent coordinates across faces.")
+                raise ValueError(f"节点 {node_id} 在不同面中的坐标不一致。")
             coordinates[node_id] = coordinate
     return coordinates
 
@@ -1256,7 +1268,7 @@ def apply_global_conservation_correction(
 ) -> tuple[dict[int, np.ndarray], dict[str, float]]:
     """施加最小范数修正，使总力和总力矩守恒。"""
     if not node_forces:
-        raise ValueError("node_forces must not be empty.")
+        raise ValueError("node_forces 不能为空。")
     node_ids = sorted(node_forces)
     dtype = np.result_type(
         np.asarray(desired_force).dtype,
@@ -1312,9 +1324,9 @@ def _apply_global_conservation_correction_batch(
 ) -> tuple[np.ndarray, list[dict[str, float]]]:
     """批量施加总力和总力矩守恒修正。"""
     if node_forces.ndim != 3 or node_forces.shape[2] != 3:
-        raise ValueError("node_forces must have shape (frequency_count, node_count, 3).")
+        raise ValueError("node_forces 必须为形状 (frequency_count, node_count, 3) 的数组。")
     if node_forces.shape[1] != len(node_ids):
-        raise ValueError("node_forces node dimension must match node_ids.")
+        raise ValueError("node_forces 的节点维度必须与 node_ids 匹配。")
 
     coordinates = np.vstack(
         [np.asarray(node_coordinates[int(node_id)], dtype=float) for node_id in node_ids]
@@ -1365,7 +1377,7 @@ def _apply_global_conservation_correction_batch(
     return corrected, stats
 
 
-def _map_complex_pressure_batch_to_nodes(
+def _map_complex_pressure_batch_to_force_array(
     target_node_ids: list[list[int]],
     target_face_points: list[np.ndarray],
     source_centers: np.ndarray,
@@ -1374,7 +1386,7 @@ def _map_complex_pressure_batch_to_nodes(
     *,
     apply_conservation: bool,
     consistent_force_plan: ConsistentForcePlan,
-) -> tuple[list[dict[int, np.ndarray]], list[dict[str, float | int]]]:
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, float | int]]]:
     """批量完成频率行到 Abaqus 节点集中力的映射。"""
     force_array, node_ids, distance_stats = apply_consistent_force_plan_batch(
         consistent_force_plan,
@@ -1407,6 +1419,29 @@ def _map_complex_pressure_batch_to_nodes(
     else:
         for item in stats:
             item["conservation_enabled"] = 0
+    return force_array, node_ids, stats
+
+
+def _map_complex_pressure_batch_to_nodes(
+    target_node_ids: list[list[int]],
+    target_face_points: list[np.ndarray],
+    source_centers: np.ndarray,
+    source_area_vectors: np.ndarray,
+    source_pressures: np.ndarray,
+    *,
+    apply_conservation: bool,
+    consistent_force_plan: ConsistentForcePlan,
+) -> tuple[list[dict[int, np.ndarray]], list[dict[str, float | int]]]:
+    """批量完成频率行到 Abaqus 节点集中力的映射。"""
+    force_array, node_ids, stats = _map_complex_pressure_batch_to_force_array(
+        target_node_ids,
+        target_face_points,
+        source_centers,
+        source_area_vectors,
+        source_pressures,
+        apply_conservation=apply_conservation,
+        consistent_force_plan=consistent_force_plan,
+    )
     return (
         [_node_force_dict(node_ids, force_array[index]) for index in range(force_array.shape[0])],
         stats,
@@ -1519,7 +1554,7 @@ def write_frequency_load_include(
     include_path = Path(path)
     lines = [
         f"** {load_name} mapped load, frequency_hz={_format_float(frequency_hz)}",
-        "** Real part",
+        "** 实部",
         "*CLOAD, REAL",
     ]
     for node_id in sorted(node_forces):
@@ -1531,7 +1566,7 @@ def write_frequency_load_include(
                     f"{_format_cload_node(node_id, node_label_prefix)}, "
                     f"{component + 1}, {_format_float(value)}"
                 )
-    lines.extend(["** Imaginary part", "*CLOAD, IMAGINARY"])
+    lines.extend(["** 虚部", "*CLOAD, IMAGINARY"])
     for node_id in sorted(node_forces):
         force = np.asarray(node_forces[node_id])
         for component in range(3):
@@ -1573,7 +1608,7 @@ def write_frequency_table_load_include(
         近零分量跳过数、全局最大力幅值和近零阈值。
     """
     if len(node_force_maps) != len(frequencies_hz):
-        raise ValueError("node_force_maps and frequencies_hz must have matching lengths.")
+        raise ValueError("node_force_maps 和 frequencies_hz 的长度必须一致。")
 
     n_freqs = len(frequencies_hz)
 
@@ -1599,10 +1634,10 @@ def write_frequency_table_load_include(
     skipped_near_zero = 0
 
     with include_path.open("w", encoding="utf-8") as fh:
-        fh.write(f"** {load_name} mapped frequency-dependent loads\n")
+        fh.write(f"** {load_name} 映射后的频率相关载荷\n")
 
         if global_max_abs_force == 0.0:
-            fh.write("** No nonzero steady-state loads were generated.\n")
+            fh.write("** 未生成非零稳态载荷。\n")
         else:
             for node_id in all_node_ids:
                 for component in range(3):
@@ -1689,8 +1724,7 @@ def estimate_time_load_records(
     records = int(node_count) * int(component_count) * int(sample_count)
     if records > int(max_records):
         raise FileSizeLimitError(
-            f"Time-domain load expansion would write {records} records; "
-            f"limit is {max_records}."
+            f"时域载荷展开将写出 {records} 条记录，当前上限为 {max_records}。"
         )
     return records
 
@@ -1713,18 +1747,26 @@ def write_time_load_include(
     Raises:
         FileSizeLimitError: 写出规模超过安全上限。
     """
+    time_values = np.asarray(times, dtype=float)
+    if time_values.ndim != 1:
+        raise ValueError("times 必须是一维数组。")
     active_records = 0
-    for force_series in node_force_series.values():
-        active_records += int(np.count_nonzero(np.asarray(force_series) != 0.0))
+    force_series_by_node: dict[int, np.ndarray] = {}
+    for node_id, force_series in node_force_series.items():
+        values = np.asarray(force_series, dtype=float)
+        if values.shape != (len(time_values), 3):
+            raise ValueError("times 的长度必须与每个节点三向力序列匹配。")
+        force_series_by_node[node_id] = values
+        active_records += int(np.count_nonzero(values != 0.0))
     estimate_time_load_records(
-        node_count=max(len(node_force_series), 1),
+        node_count=max(len(force_series_by_node), 1),
         component_count=3,
-        sample_count=len(times),
+        sample_count=len(time_values),
         max_records=max_records,
     )
-    lines = ["** CGNS_PRESSURE mapped time-domain loads"]
-    for node_id in sorted(node_force_series):
-        values = np.asarray(node_force_series[node_id], dtype=float)
+    lines = ["** CGNS_PRESSURE 映射后的时域载荷"]
+    for node_id in sorted(force_series_by_node):
+        values = force_series_by_node[node_id]
         for component in range(3):
             series = values[:, component]
             if not np.any(series != 0.0):
@@ -1733,7 +1775,7 @@ def write_time_load_include(
             lines.append(f"*Amplitude, name={amp_name}, time=TOTAL TIME")
             pairs = [
                 f"{_format_float(float(time_value))}, {_format_float(float(load_value))}"
-                for time_value, load_value in zip(times, series)
+                for time_value, load_value in zip(time_values, series)
             ]
             lines.extend(pairs)
             lines.append(f"*CLOAD, amplitude={amp_name}")
@@ -1742,8 +1784,116 @@ def write_time_load_include(
                 f"{component + 1}, 1."
             )
     if active_records == 0:
-        lines.append("** No nonzero time-domain loads were generated.")
+        lines.append("** 未生成非零时域载荷。")
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_time_load_include_from_force_maps(
+    path: str | Path,
+    node_force_maps: Iterable[dict[int, np.ndarray]],
+    times: np.ndarray,
+    max_records: int = 500000,
+    node_label_prefix: str = "",
+) -> None:
+    """按时间步节点力映射直接写出时域 include，避免额外堆叠节点时间序列。"""
+    force_maps = list(node_force_maps)
+    time_values = np.asarray(times, dtype=float)
+    if time_values.ndim != 1:
+        raise ValueError("times 必须是一维数组。")
+    if len(force_maps) != len(time_values):
+        raise ValueError("times 的长度必须与节点力映射数量匹配。")
+    node_ids = sorted({node_id for force_map in force_maps for node_id in force_map})
+    estimate_time_load_records(
+        node_count=max(len(node_ids), 1),
+        component_count=3,
+        sample_count=len(time_values),
+        max_records=max_records,
+    )
+
+    lines = ["** CGNS_PRESSURE 映射后的时域载荷"]
+    active_records = 0
+    for node_id in node_ids:
+        for component in range(3):
+            pairs: list[str] = []
+            has_nonzero = False
+            for time_value, force_map in zip(time_values, force_maps):
+                force = force_map.get(node_id)
+                if force is None:
+                    load_value = 0.0
+                else:
+                    force_values = np.asarray(force, dtype=float)
+                    if force_values.shape != (3,):
+                        raise ValueError("每个节点力条目必须包含三个分量。")
+                    load_value = float(np.real(force_values[component]))
+                if load_value != 0.0:
+                    has_nonzero = True
+                    active_records += 1
+                pairs.append(f"{_format_float(float(time_value))}, {_format_float(load_value)}")
+            if not has_nonzero:
+                continue
+            amp_name = f"CGNS_N{node_id}_D{component + 1}"
+            lines.append(f"*Amplitude, name={amp_name}, time=TOTAL TIME")
+            lines.extend(pairs)
+            lines.append(f"*CLOAD, amplitude={amp_name}")
+            lines.append(
+                f"{_format_cload_node(node_id, node_label_prefix)}, "
+                f"{component + 1}, 1."
+            )
+    if active_records == 0:
+        lines.append("** 未生成非零时域载荷。")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_time_load_include_from_force_array(
+    path: str | Path,
+    node_ids: np.ndarray,
+    node_force_array: np.ndarray,
+    times: np.ndarray,
+    max_records: int = 500000,
+    node_label_prefix: str = "",
+) -> None:
+    """从 `(time, node, component)` 节点力数组写出时域 include，避免 dict/字符串堆叠。"""
+    time_values = np.asarray(times, dtype=float)
+    if time_values.ndim != 1:
+        raise ValueError("times 必须是一维数组。")
+    ids = np.asarray(node_ids, dtype=int)
+    forces = np.asarray(node_force_array)
+    if forces.ndim != 3 or forces.shape[2] != 3:
+        raise ValueError("node_force_array 必须为形状 (time_count, node_count, 3) 的数组。")
+    if forces.shape[0] != len(time_values):
+        raise ValueError("times 的长度必须与 node_force_array 的时间维度匹配。")
+    if forces.shape[1] != len(ids):
+        raise ValueError("node_force_array 的节点维度必须与 node_ids 匹配。")
+    estimate_time_load_records(
+        node_count=max(len(ids), 1),
+        component_count=3,
+        sample_count=len(time_values),
+        max_records=max_records,
+    )
+
+    active_records = 0
+    with Path(path).open("w", encoding="utf-8") as handle:
+        handle.write("** CGNS_PRESSURE 映射后的时域载荷\n")
+        for node_index, node_id in enumerate(ids):
+            for component in range(3):
+                series = np.real(forces[:, node_index, component])
+                if not np.any(series != 0.0):
+                    continue
+                active_records += int(np.count_nonzero(series != 0.0))
+                amp_name = f"CGNS_N{int(node_id)}_D{component + 1}"
+                handle.write(f"*Amplitude, name={amp_name}, time=TOTAL TIME\n")
+                for time_value, load_value in zip(time_values, series):
+                    handle.write(
+                        f"{_format_float(float(time_value))}, "
+                        f"{_format_float(float(load_value))}\n"
+                    )
+                handle.write(f"*CLOAD, amplitude={amp_name}\n")
+                handle.write(
+                    f"{_format_cload_node(int(node_id), node_label_prefix)}, "
+                    f"{component + 1}, 1.\n"
+                )
+        if active_records == 0:
+            handle.write("** 未生成非零时域载荷。\n")
 
 
 def find_frequency_index(
@@ -1766,13 +1916,13 @@ def find_frequency_index(
     """
     frequencies = np.asarray(frequencies_hz, dtype=float)
     if frequencies.size == 0:
-        raise ValueError("Extracted frequency array is empty.")
+        raise ValueError("提取结果中的频率数组为空。")
     index = int(np.argmin(np.abs(frequencies - float(target_frequency_hz))))
     delta = abs(float(frequencies[index]) - float(target_frequency_hz))
     if delta > float(tolerance_hz):
         raise ValueError(
-            f"No extracted frequency is within {tolerance_hz:g} Hz of "
-            f"{target_frequency_hz:g} Hz; closest is {frequencies[index]:g} Hz."
+            f"没有提取频率落在 {target_frequency_hz:g} Hz 的 "
+            f"{tolerance_hz:g} Hz 容差内；最接近的是 {frequencies[index]:g} Hz。"
         )
     return index
 
@@ -1793,10 +1943,10 @@ def _load_surface_geometry(extracted_dir: Path, name: str) -> tuple[np.ndarray, 
     """
     path = extracted_dir / name
     if not path.exists():
-        raise FileNotFoundError(f"Required surface geometry file was not found: {path}")
+        raise FileNotFoundError(f"找不到必需的表面几何文件：{path}")
     with np.load(path) as saved:
         if "centers" not in saved or "area_vectors" not in saved:
-            raise ValueError(f"{path} must contain centers and area_vectors arrays.")
+            raise ValueError(f"{path} 必须包含 centers 和 area_vectors 数组。")
         return (
             np.asarray(saved["centers"], dtype=float),
             np.asarray(saved["area_vectors"], dtype=float),
@@ -1814,7 +1964,7 @@ def _unique_target_nodes(target_faces: TargetFaces) -> np.ndarray:
             seen.add(node_id)
             points.append(np.asarray(point, dtype=float))
     if not points:
-        raise ValueError("Target faces did not contain any nodes.")
+        raise ValueError("目标面不包含任何节点。")
     return np.vstack(points)
 
 
@@ -1895,7 +2045,7 @@ def _load_complex_spectrum(
     """
     path = extracted_dir / name
     if not path.exists():
-        raise FileNotFoundError(f"Required complex spectrum file was not found: {path}")
+        raise FileNotFoundError(f"找不到必需的复数压力谱文件：{path}")
     with np.load(path) as saved:
         frequencies = np.asarray(saved["frequencies_hz"], dtype=float)
         pressure = (
@@ -1911,7 +2061,7 @@ def _discard_bytes(reader: Any, byte_count: int) -> None:
     while remaining > 0:
         chunk = reader.read(min(remaining, 1024 * 1024))
         if not chunk:
-            raise ValueError("Unexpected end of npz array while skipping rows.")
+            raise ValueError("跳过行时 npz 数组意外结束。")
         remaining -= len(chunk)
 
 
@@ -1923,7 +2073,7 @@ def _read_npy_header(reader: Any) -> tuple[tuple[int, ...], bool, np.dtype[Any]]
     elif version in {(2, 0), (3, 0)}:
         shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(reader)
     else:
-        raise ValueError(f"Unsupported npy version in npz member: {version}")
+        raise ValueError(f"npz 成员中的 npy 版本不受支持：{version}")
     return tuple(int(value) for value in shape), bool(fortran_order), np.dtype(dtype)
 
 
@@ -1935,9 +2085,9 @@ class _NpzArrayRowStream:
         self._reader = archive.open(member_name)
         shape, fortran_order, dtype = _read_npy_header(self._reader)
         if fortran_order:
-            raise ValueError(f"{member_name} must be C-contiguous.")
+            raise ValueError(f"{member_name} 必须为 C 连续布局。")
         if len(shape) != 2:
-            raise ValueError(f"{member_name} must be a two-dimensional array.")
+            raise ValueError(f"{member_name} 必须是二维数组。")
         self.shape = tuple(int(value) for value in shape)
         self.dtype = np.dtype(dtype)
         self._row_bytes = self.shape[1] * self.dtype.itemsize
@@ -1955,18 +2105,18 @@ class _NpzArrayRowStream:
         result = np.empty((rows.size, self.shape[1]), dtype=self.dtype)
         for output_index, row_index in enumerate(rows):
             if row_index < 0 or row_index >= self.shape[0]:
-                raise IndexError("pressure spectrum row index is out of bounds.")
+                raise IndexError("压力谱行索引越界。")
             if row_index == self._last_row_index and self._last_row is not None:
                 result[output_index] = self._last_row
                 continue
             if row_index < self._current_row:
                 raise ValueError(
-                    "streamed pressure spectrum rows must be requested in ascending order."
+                    "流式压力谱行必须按升序读取。"
                 )
             _discard_bytes(self._reader, (row_index - self._current_row) * self._row_bytes)
             raw = self._reader.read(self._row_bytes)
             if len(raw) != self._row_bytes:
-                raise ValueError("Unexpected end of npz array while reading a row.")
+                raise ValueError("读取行时 npz 数组意外结束。")
             row = np.frombuffer(raw, dtype=self.dtype, count=self.shape[1]).copy()
             result[output_index] = row
             self._current_row = row_index + 1
@@ -1981,7 +2131,7 @@ class _ComplexSpectrumRowReader:
     def __init__(self, path: Path):
         """记录频谱文件路径并预读取频率轴。"""
         if not path.exists():
-            raise FileNotFoundError(f"Required complex spectrum file was not found: {path}")
+            raise FileNotFoundError(f"找不到必需的复数压力谱文件：{path}")
         self.path = path
         self.frequencies = self._load_frequencies(path)
         self._archive: zipfile.ZipFile | None = None
@@ -2002,9 +2152,9 @@ class _ComplexSpectrumRowReader:
             self._real = _NpzArrayRowStream(self._archive, "pressure_real.npy")
             self._imag = _NpzArrayRowStream(self._archive, "pressure_imag.npy")
             if self._real.shape != self._imag.shape:
-                raise ValueError("pressure_real and pressure_imag must have matching shapes.")
+                raise ValueError("pressure_real 和 pressure_imag 的形状必须一致。")
             if self._real.shape[0] != self.frequencies.size:
-                raise ValueError("pressure spectrum row count must match frequencies_hz.")
+                raise ValueError("压力谱行数必须与 frequencies_hz 匹配。")
             self.source_count = self._real.shape[1]
         except Exception:
             self.__exit__(None, None, None)
@@ -2034,7 +2184,7 @@ class _ComplexSpectrumRowReader:
     def read_complex_rows(self, row_indices: np.ndarray) -> np.ndarray:
         """读取指定频率行并合成为复数压力矩阵。"""
         if self._real is None or self._imag is None:
-            raise RuntimeError("Complex spectrum reader is not open.")
+            raise RuntimeError("复数压力谱读取器尚未打开。")
         real = self._real.read_rows(row_indices)
         imag = self._imag.read_rows(row_indices)
         return real + 1j * imag
@@ -2080,11 +2230,21 @@ def _load_time_pressure(
     """
     path = extracted_dir / name
     if not path.exists():
-        raise FileNotFoundError(f"Required time pressure file was not found: {path}")
+        raise FileNotFoundError(f"找不到必需的时域压力文件：{path}")
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         payload = json.load(handle)
     times = np.asarray(payload["time_s"], dtype=float)
     pressure = np.asarray(payload["pulsating_pressure"], dtype=float)
+    if times.ndim != 1:
+        raise ValueError("time_s 必须是一维数组。")
+    if pressure.ndim != 2:
+        raise ValueError("pulsating_pressure 必须为形状 (time_count, source_count) 的数组。")
+    if pressure.shape[0] != times.shape[0]:
+        raise ValueError("time_s 的长度必须与 pulsating_pressure 行数匹配。")
+    if pressure.shape[0] == 0 or pressure.shape[1] == 0:
+        raise ValueError("pulsating_pressure 至少需要包含一个时间样本和一个源面样本。")
+    if not np.all(np.isfinite(times)) or not np.all(np.isfinite(pressure)):
+        raise ValueError("时域压力数据中包含 NaN 或无穷值。")
     return times, pressure
 
 
@@ -2199,14 +2359,14 @@ def _split_frequency_groups(
     if not frequencies_hz:
         return []
     if value is None:
-        raise ValueError("frequency_group_value is required when frequency grouping is enabled.")
+        raise ValueError("启用频率分组时必须提供 frequency_group_value。")
     if mode == "groups":
         group_count_float = float(value)
         group_count = int(group_count_float)
         if group_count <= 0 or not math.isclose(group_count_float, float(group_count)):
-            raise ValueError("frequency_group_value must be a positive integer for groups mode.")
+            raise ValueError("groups 模式下 frequency_group_value 必须是正整数。")
         if group_count > len(frequencies_hz):
-            raise ValueError("frequency_group_value must not exceed the requested frequency count.")
+            raise ValueError("frequency_group_value 不能超过请求的频率数量。")
         base_size, extra = divmod(len(frequencies_hz), group_count)
         groups: list[tuple[int, int]] = []
         start = 0
@@ -2219,7 +2379,7 @@ def _split_frequency_groups(
     if mode == "bandwidth":
         bandwidth = float(value)
         if not math.isfinite(bandwidth) or bandwidth <= 0.0:
-            raise ValueError("frequency_group_value must be positive for bandwidth grouping.")
+            raise ValueError("bandwidth 模式下 frequency_group_value 必须为正数。")
         groups: list[tuple[int, int]] = []
         start = 0
         tolerance = bandwidth * 1.0e-12
@@ -2234,7 +2394,7 @@ def _split_frequency_groups(
             groups.append((start, end))
             start = end
         return groups
-    raise ValueError(f"Unsupported frequency_group_mode: {mode}")
+    raise ValueError(f"不支持的 frequency_group_mode：{mode}")
 
 
 def _grouped_output_path(output: Path, group_index: int, frequencies_hz: list[float]) -> Path:
@@ -2258,13 +2418,13 @@ def _load_model_step(model: AbaqusModel, requested_step: str | None) -> AbaqusSt
         ValueError: 模型没有分析步，或指定名称不存在。
     """
     if not model.steps:
-        raise ValueError("The INP file does not contain an Abaqus *Step.")
+        raise ValueError("INP 文件中没有 Abaqus *Step。")
     if requested_step is None:
         return model.steps[0]
     for step in model.steps:
         if step.name.upper() == requested_step.upper():
             return step
-    raise ValueError(f"Step '{requested_step}' was not found.")
+    raise ValueError(f"找不到分析步 '{requested_step}'。")
 
 
 def run_mapping(
@@ -2345,9 +2505,9 @@ def run_mapping(
     extracted = Path(extracted_dir)
     output = Path(output_path) if output_path is not None else _default_output_path(inp)
     if output.resolve() == inp.resolve():
-        raise ValueError("Output INP must not overwrite the original INP.")
+        raise ValueError("输出 INP 不能覆盖原始 INP。")
     if not target_set:
-        raise ValueError("target_set is required; mapping all nodes is not supported.")
+        raise ValueError("必须提供 target_set；不支持直接映射全部节点。")
 
     model = parse_inp_file(inp)
     step = _load_model_step(model, step_name)
@@ -2389,7 +2549,7 @@ def run_mapping(
 
     if step.kind == "steady_state":
         if not frequencies:
-            raise ValueError("At least one --frequency is required for steady-state mapping.")
+            raise ValueError("稳态映射至少需要提供一个 --frequency。")
 
         if show_progress:
             print("加载复数压力谱…")
@@ -2422,7 +2582,7 @@ def run_mapping(
         if not _is_non_decreasing(spectrum_indices):
             spectrum_reader.close()
             raise ValueError(
-                "Streamed frequency mapping requires requested frequencies in ascending order."
+                "流式频率映射要求请求频率按升序排列。"
             )
         mapped_frequencies = [
             float(extracted_frequencies[spectrum_index])
@@ -2451,6 +2611,7 @@ def run_mapping(
                 for start, end in group_ranges
             ),
         )
+        worker_count = _resolve_worker_count(num_workers)
         progress_total = batch_count + 4
         _report_mapping_progress(
             progress_callback,
@@ -2486,13 +2647,11 @@ def run_mapping(
             return specs
 
         # 单个批次的工作函数（闭包捕获只读共享数据，线程安全）
-        def _process_batch(spec: tuple[int, np.ndarray]) -> tuple[
+        def _map_batch_pressures(batch_pressures: np.ndarray) -> tuple[
             list[dict[int, np.ndarray]],
             list[dict[str, float | int]],
         ]:
             """读取一个频率批次并映射成节点力。"""
-            _batch_start, batch_slice = spec
-            batch_pressures = spectrum_reader.read_complex_rows(batch_slice)
             return _map_complex_pressure_batch_to_nodes(
                 target_faces.node_ids,
                 target_faces.face_points,
@@ -2511,26 +2670,77 @@ def run_mapping(
                 group_frequencies = mapped_frequencies[start:end]
                 group_force_maps: list[dict[int, np.ndarray]] = []
                 group_batch_stats: list[dict[str, float | int]] = []
+                batch_specs = _group_batch_specs(start, end)
 
-                for spec in _group_batch_specs(start, end):
-                    next_batch_number = processed_batch_count + 1
-                    if show_progress and batch_count > 1:
-                        print(
-                            f"  处理频率块 {next_batch_number}/{batch_count} "
-                            f"({len(spec[1])} 个频率)..."
-                        )
-                    batch_force_maps, batch_chunk_stats = _process_batch(spec)
+                def record_batch_result(
+                    batch_number: int,
+                    batch_force_maps: list[dict[int, np.ndarray]],
+                    batch_chunk_stats: list[dict[str, float | int]],
+                ) -> None:
+                    nonlocal processed_batch_count
                     if show_progress and batch_count > 1:
                         print("    完成")
                     group_force_maps.extend(batch_force_maps)
                     group_batch_stats.extend(batch_chunk_stats)
-                    processed_batch_count = next_batch_number
+                    processed_batch_count = batch_number
                     _report_mapping_progress(
                         progress_callback,
                         processed_batch_count + 2,
                         progress_total,
                         f"频率块 {processed_batch_count}/{batch_count}",
                     )
+
+                if worker_count <= 1 or len(batch_specs) <= 1:
+                    for spec in batch_specs:
+                        next_batch_number = processed_batch_count + 1
+                        if show_progress and batch_count > 1:
+                            print(
+                                f"  处理频率块 {next_batch_number}/{batch_count} "
+                                f"({len(spec[1])} 个频率)..."
+                            )
+                        batch_pressures = spectrum_reader.read_complex_rows(spec[1])
+                        batch_force_maps, batch_chunk_stats = _map_batch_pressures(
+                            batch_pressures
+                        )
+                        record_batch_result(
+                            next_batch_number,
+                            batch_force_maps,
+                            batch_chunk_stats,
+                        )
+                else:
+                    pending: list[tuple[int, Any]] = []
+                    next_batch_number = processed_batch_count
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        for spec in batch_specs:
+                            next_batch_number += 1
+                            if show_progress and batch_count > 1:
+                                print(
+                                    f"  处理频率块 {next_batch_number}/{batch_count} "
+                                    f"({len(spec[1])} 个频率)..."
+                                )
+                            batch_pressures = spectrum_reader.read_complex_rows(spec[1])
+                            pending.append(
+                                (
+                                    next_batch_number,
+                                    executor.submit(_map_batch_pressures, batch_pressures),
+                                )
+                            )
+                            if len(pending) >= worker_count:
+                                batch_number, future = pending.pop(0)
+                                batch_force_maps, batch_chunk_stats = future.result()
+                                record_batch_result(
+                                    batch_number,
+                                    batch_force_maps,
+                                    batch_chunk_stats,
+                                )
+                        while pending:
+                            batch_number, future = pending.pop(0)
+                            batch_force_maps, batch_chunk_stats = future.result()
+                            record_batch_result(
+                                batch_number,
+                                batch_force_maps,
+                                batch_chunk_stats,
+                            )
 
                 for requested_frequency, mapped_frequency, stats in zip(
                     frequencies[start:end],
@@ -2629,42 +2839,36 @@ def run_mapping(
             transformed_source_centers,
             k=k,
         )
-        progress_total = int(pressure_time.shape[0]) + 3
+        time_sample_count = int(pressure_time.shape[0])
+        progress_total = time_sample_count + 3
         _report_mapping_progress(
             progress_callback,
             1,
             progress_total,
             "数据已加载",
         )
-        node_series: dict[int, np.ndarray] = {}
-        last_stats: dict[str, float | int] = {}
-        for time_index in range(pressure_time.shape[0]):
-            node_forces, last_stats = map_complex_pressure_to_nodes(
-                target_faces.centers,
-                target_faces.area_vectors,
-                target_faces.node_ids,
-                transformed_source_centers,
-                pressure_time[time_index],
-                k=k,
-                target_face_points=target_faces.face_points,
-                source_area_vectors=transformed_source_area_vectors,
-                apply_conservation=conserve_global_loads,
-                consistent_force_plan=consistent_force_plan,
-            )
-            for node_id, force in node_forces.items():
-                if node_id not in node_series:
-                    node_series[node_id] = np.zeros((pressure_time.shape[0], 3), dtype=float)
-                node_series[node_id][time_index] = np.real(force)
+        node_force_array, time_node_ids, time_stats = _map_complex_pressure_batch_to_force_array(
+            target_faces.node_ids,
+            target_faces.face_points,
+            transformed_source_centers,
+            transformed_source_area_vectors,
+            pressure_time,
+            apply_conservation=conserve_global_loads,
+            consistent_force_plan=consistent_force_plan,
+        )
+        del pressure_time
+        for time_index in range(time_sample_count):
             _report_mapping_progress(
                 progress_callback,
                 time_index + 2,
                 progress_total,
-                f"时间步 {time_index + 1}/{pressure_time.shape[0]}",
+                f"时间步 {time_index + 1}/{time_sample_count}",
             )
         include_path = output.with_name(f"{output.stem}_loads.inc")
-        write_time_load_include(
+        write_time_load_include_from_force_array(
             include_path,
-            node_series,
+            time_node_ids,
+            node_force_array,
             times,
             max_records=max_time_records,
             node_label_prefix=node_label_prefix,
@@ -2679,8 +2883,8 @@ def run_mapping(
         )
         report.update(
             {
-                "time_sample_count": int(len(times)),
-                "mapping_stats": last_stats,
+                "time_sample_count": time_sample_count,
+                "mapping_stats": time_stats[-1] if time_stats else {},
                 "include_file_count": len(include_paths),
                 "output_inp_count": len(output_paths),
                 "output_inps": [str(output)],
@@ -2689,7 +2893,7 @@ def run_mapping(
         )
     else:
         raise ValueError(
-            "Only *STEADY STATE DYNAMICS and *DYNAMIC steps are supported for mapping."
+            "当前映射只支持 *STEADY STATE DYNAMICS 和 *DYNAMIC 分析步。"
         )
 
     if show_progress:
@@ -2726,7 +2930,7 @@ def _parse_triplet(text: str, *, cast=float) -> tuple[Any, Any, Any]:
     """解析 CLI 中的三元组参数，例如坐标平移或轴顺序。"""
     parts = [part.strip() for part in text.split(",")]
     if len(parts) != 3:
-        raise argparse.ArgumentTypeError("Expected three comma-separated values.")
+        raise argparse.ArgumentTypeError("需要输入三个逗号分隔的值。")
     return tuple(cast(part) for part in parts)  # type: ignore[return-value]
 
 
@@ -2736,12 +2940,12 @@ def _expand_frequency_range(text: str) -> list[float]:
         start, end, step = (float(part.strip()) for part in text.split(":"))
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "Expected frequency range as start:end:step, for example 1:800:1."
+            "频率范围应写成 start:end:step，例如 1:800:1。"
         ) from exc
     if step <= 0.0:
-        raise argparse.ArgumentTypeError("Frequency range step must be positive.")
+        raise argparse.ArgumentTypeError("频率范围的 step 必须为正数。")
     if end < start:
-        raise argparse.ArgumentTypeError("Frequency range end must be >= start.")
+        raise argparse.ArgumentTypeError("频率范围的 end 必须大于或等于 start。")
 
     values: list[float] = []
     current = start
@@ -2793,7 +2997,7 @@ def parse_gui_axis_order(text: str) -> tuple[int, int, int]:
     """解析 GUI 坐标轴顺序文本。"""
     axis_order = _parse_gui_triplet(text, cast=int)
     if sorted(axis_order) != [0, 1, 2]:
-        raise ValueError("axis_order must be a permutation of 0, 1, 2.")
+        raise ValueError("axis_order 必须是 0、1、2 的排列。")
     return axis_order  # type: ignore[return-value]
 
 
@@ -2812,94 +3016,94 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         argparse 解析后的命名空间。
     """
     parser = argparse.ArgumentParser(
-        description="Map extracted CGNS pressure data onto an Abaqus INP model.",
+        description="将已提取的 CGNS 压力数据映射到 Abaqus INP 模型。",
     )
-    parser.add_argument("--inp", required=True, help="Input Abaqus INP path.")
+    parser.add_argument("--inp", required=True, help="输入 Abaqus INP 文件路径。")
     parser.add_argument(
         "--extracted",
         required=True,
-        help="Directory containing extracted CGNS outputs.",
+        help="包含 CGNS 提取结果的目录。",
     )
-    parser.add_argument("--target-set", required=True, help="Target Nset or Elset name.")
+    parser.add_argument("--target-set", required=True, help="目标 Nset 或 Elset 名称。")
     parser.add_argument(
         "--target-set-type",
         choices=("nset", "elset"),
         required=True,
-        help="Whether --target-set names an Nset or Elset.",
+        help="说明 --target-set 指向 Nset 还是 Elset。",
     )
     parser.add_argument(
         "--frequency",
         action="append",
         type=float,
-        help="Target frequency in Hz. Repeat for multiple runs; v1 maps one per output.",
+        help="目标频率，单位 Hz；可重复指定多个频率。",
     )
     parser.add_argument(
         "--frequency-range",
         action="append",
-        help="Inclusive frequency range as start:end:step in Hz, e.g. 1:800:1.",
+        help="闭区间频率范围，格式为 start:end:step，单位 Hz，例如 1:800:1。",
     )
-    parser.add_argument("--output", help="Output INP path.")
-    parser.add_argument("--step-name", help="Step name to receive the load include.")
+    parser.add_argument("--output", help="输出 INP 文件路径。")
+    parser.add_argument("--step-name", help="接收载荷 include 的分析步名称。")
     parser.add_argument(
         "--frequency-tolerance-hz",
         type=float,
         default=1.0e-6,
-        help="Maximum allowed difference between requested and extracted frequency.",
+        help="请求频率与提取频率之间允许的最大差值。",
     )
-    parser.add_argument("--k", type=int, default=4, help="Nearest source faces for IDW.")
-    parser.add_argument("--scale", type=float, default=1.0, help="Coordinate scale factor.")
+    parser.add_argument("--k", type=int, default=4, help="IDW 插值使用的最近源面数量。")
+    parser.add_argument("--scale", type=float, default=1.0, help="坐标比例系数。")
     parser.add_argument(
         "--translate",
         type=lambda text: np.array(_parse_triplet(text, cast=float), dtype=float),
-        help="Coordinate translation as dx,dy,dz.",
+        help="坐标平移量，格式为 dx,dy,dz。",
     )
     parser.add_argument(
         "--axis-order",
         type=lambda text: _parse_triplet(text, cast=int),
         default=(0, 1, 2),
-        help="Coordinate axis order, e.g. 0,1,2 or 2,0,1.",
+        help="坐标轴顺序，例如 0,1,2 或 2,0,1。",
     )
     parser.add_argument(
         "--axis-sign",
         type=lambda text: _parse_triplet(text, cast=float),
         default=(1.0, 1.0, 1.0),
-        help="Coordinate axis signs, e.g. 1,-1,1.",
+        help="坐标轴方向符号，例如 1,-1,1。",
     )
     parser.add_argument(
         "--max-time-records",
         type=int,
         default=500000,
-        help="Safety limit for expanded time-domain load records.",
+        help="时域载荷展开记录数的安全上限。",
     )
     parser.add_argument(
         "--frequency-batch-size",
         type=int,
         default=None,
-        help="Number of frequencies to process per batch; default processes all at once.",
+        help="每批处理的频率数量；默认一次处理全部频率。",
     )
     parser.add_argument(
         "--frequency-group-mode",
         choices=("none", "groups", "bandwidth"),
         default="none",
-        help="Output grouping mode for steady-state frequencies; default writes one INP.",
+        help="稳态频率输出分组模式；默认写入单个 INP。",
     )
     parser.add_argument(
         "--frequency-group-value",
         type=float,
         default=None,
-        help="Group size: total group count or bandwidth in Hz.",
+        help="分组值：总组数或 Hz 带宽。",
     )
     parser.add_argument(
         "--relative-zero-tolerance",
         type=float,
         default=1.0e-12,
-        help="Relative threshold (× global max force) below which components are skipped.",
+        help="近零过滤相对阈值，小于该阈值乘全局最大力的分量会被跳过。",
     )
     parser.add_argument(
         "--num-workers",
         type=int,
         default=1,
-        help="Number of threads for parallel frequency-batch processing; default 1 (serial). 0 = auto.",
+        help="并行处理频率批次的线程数；默认 1 表示串行，0 表示自动。",
     )
     return parser.parse_args(argv)
 
@@ -2937,13 +3141,13 @@ def run_cli(argv: list[str] | None = None) -> int:
             num_workers=args.num_workers,
         )
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"错误：{exc}", file=sys.stderr)
         return 1
     for output_path in result.output_inp_paths:
-        print(f"Wrote: {output_path}")
+        print(f"已写入：{output_path}")
     for include_path in result.include_paths:
-        print(f"Wrote: {include_path}")
-    print(f"Wrote: {result.report_path}")
+        print(f"已写入：{include_path}")
+    print(f"已写入：{result.report_path}")
     return 0
 
 

@@ -212,7 +212,7 @@ def _load_h5py() -> Any:
         import h5py
     except ImportError as exc:
         raise RuntimeError(
-            "h5py is required to read HDF5-CGNS files. Install it with: pip install h5py"
+            "读取 HDF5-CGNS 文件需要安装 h5py。安装命令：pip install h5py"
         ) from exc
     return h5py
 
@@ -276,7 +276,7 @@ def expand_input_files(patterns: Iterable[str | Path]) -> list[Path]:
 
     existing_paths = [path for path in paths if path.exists()]
     if not existing_paths:
-        raise FileNotFoundError("No CGNS files matched the input pattern.")
+        raise FileNotFoundError("没有 CGNS 文件匹配输入路径或模式。")
     return sort_time_step_paths(existing_paths)
 
 
@@ -358,7 +358,7 @@ def _find_pressure_dataset(root: Any, pressure_name: str | None) -> tuple[str, A
         for path, dataset in datasets:
             if _dataset_matches(path, pressure_name):
                 return path, dataset
-        raise ValueError(f"Pressure dataset '{pressure_name}' was not found.")
+        raise ValueError(f"找不到压力数据集 '{pressure_name}'。")
 
     by_name = {}
     for path, dataset in datasets:
@@ -370,8 +370,8 @@ def _find_pressure_dataset(root: Any, pressure_name: str | None) -> tuple[str, A
 
     available = ", ".join(_dataset_match_names(path)[0] for path, _ in datasets) or "<none>"
     raise ValueError(
-        "Pressure dataset was not found. Checked names: "
-        f"{', '.join(DEFAULT_PRESSURE_NAMES)}. Available datasets: {available}"
+        "找不到压力数据集。已检查名称："
+        f"{', '.join(DEFAULT_PRESSURE_NAMES)}。可用数据集：{available}"
     )
 
 
@@ -458,13 +458,13 @@ def _pressure_vector(dataset: Any, dataset_path: str) -> np.ndarray:
     values = np.asarray(dataset, dtype=float).squeeze()
     if values.ndim != 1:
         raise ValueError(
-            f"Pressure dataset {dataset_path} must be one-dimensional after squeezing; "
-            f"got shape {values.shape}."
+            f"压力数据集 {dataset_path} squeeze 后必须是一维数组；"
+            f"当前形状为 {values.shape}。"
         )
     if values.size == 0:
-        raise ValueError(f"Pressure dataset {dataset_path} is empty.")
+        raise ValueError(f"压力数据集 {dataset_path} 为空。")
     if not np.all(np.isfinite(values)):
-        raise ValueError(f"Pressure dataset {dataset_path} contains NaN or infinite values.")
+        raise ValueError(f"压力数据集 {dataset_path} 包含 NaN 或无穷值。")
     return values
 
 
@@ -509,8 +509,8 @@ def _pressure_vector_slice(
     channel_count = shape_values[axis]
     if start < 0 or end < start or end > channel_count:
         raise ValueError(
-            f"Pressure slice [{start}:{end}] is outside dataset {dataset_path} "
-            f"with {channel_count} channels."
+            f"压力切片 [{start}:{end}] 超出数据集 {dataset_path} 范围；"
+            f"该数据集共有 {channel_count} 个通道。"
         )
 
     if len(shape_values) == 1:
@@ -529,17 +529,17 @@ def _pressure_vector_slice(
         values = values.reshape(1)
     if values.ndim != 1:
         raise ValueError(
-            f"Pressure dataset {dataset_path} slice must be one-dimensional after "
-            f"squeezing; got shape {values.shape}."
+            f"压力数据集 {dataset_path} 的切片 squeeze 后必须是一维数组；"
+            f"当前形状为 {values.shape}。"
         )
     if values.size != end - start:
         raise ValueError(
-            f"Pressure dataset {dataset_path} slice returned {values.size} values; "
-            f"expected {end - start}."
+            f"压力数据集 {dataset_path} 的切片返回 {values.size} 个值；"
+            f"期望 {end - start} 个。"
         )
     if not np.all(np.isfinite(values)):
         raise ValueError(
-            f"Pressure dataset {dataset_path} slice contains NaN or infinite values."
+            f"压力数据集 {dataset_path} 的切片包含 NaN 或无穷值。"
         )
     return values, channel_count
 
@@ -557,13 +557,13 @@ def _coordinate_vector(dataset: Any, dataset_path: str) -> np.ndarray:
     values = np.asarray(dataset, dtype=float).squeeze()
     if values.ndim != 1:
         raise ValueError(
-            f"Coordinate dataset {dataset_path} must be one-dimensional after squeezing; "
-            f"got shape {values.shape}."
+            f"坐标数据集 {dataset_path} squeeze 后必须是一维数组；"
+            f"当前形状为 {values.shape}。"
         )
     if values.size == 0:
-        raise ValueError(f"Coordinate dataset {dataset_path} is empty.")
+        raise ValueError(f"坐标数据集 {dataset_path} 为空。")
     if not np.all(np.isfinite(values)):
-        raise ValueError(f"Coordinate dataset {dataset_path} contains NaN or infinite values.")
+        raise ValueError(f"坐标数据集 {dataset_path} 包含 NaN 或无穷值。")
     return values
 
 
@@ -628,10 +628,10 @@ def parse_mixed_tri3_faces(connectivity: np.ndarray, element_range: np.ndarray) 
     connectivity_values = np.asarray(connectivity, dtype=int).ravel()
     element_range_values = np.asarray(element_range, dtype=int).ravel()
     if element_range_values.size != 2:
-        raise ValueError("ElementRange must contain exactly two values.")
+        raise ValueError("ElementRange 必须恰好包含两个值。")
     expected_face_count = int(element_range_values[1] - element_range_values[0] + 1)
     if expected_face_count <= 0:
-        raise ValueError("ElementRange must describe at least one element.")
+        raise ValueError("ElementRange 至少要描述一个单元。")
 
     faces: list[np.ndarray] = []
     index = 0
@@ -639,20 +639,20 @@ def parse_mixed_tri3_faces(connectivity: np.ndarray, element_range: np.ndarray) 
         element_code = int(connectivity_values[index])
         if element_code != TRI_3_MIXED_ELEMENT_CODE:
             raise ValueError(
-                "Only CGNS Mixed TRI_3 elements are supported; "
-                f"got element code {element_code} at connectivity index {index}."
+                "仅支持 CGNS Mixed TRI_3 单元；"
+                f"在 connectivity 索引 {index} 处得到单元代码 {element_code}。"
             )
         if index + 3 >= connectivity_values.size:
-            raise ValueError("ElementConnectivity ended inside a TRI_3 record.")
+            raise ValueError("ElementConnectivity 在 TRI_3 记录中间结束。")
         face = connectivity_values[index + 1 : index + 4]
         if np.any(face <= 0):
-            raise ValueError("CGNS face vertex indices must be positive 1-based values.")
+            raise ValueError("CGNS 面顶点索引必须是从 1 开始的正数。")
         faces.append(face - 1)  # 转 0-based
         index += 4
 
     if len(faces) != expected_face_count:
         raise ValueError(
-            f"Parsed {len(faces)} faces, but ElementRange describes {expected_face_count}."
+            f"解析得到 {len(faces)} 个面，但 ElementRange 描述了 {expected_face_count} 个。"
         )
     return np.vstack(faces).astype(int, copy=False)
 
@@ -679,15 +679,15 @@ def compute_triangle_surface_geometry(
     coordinate_array = np.asarray(coordinates, dtype=float)
     face_array = np.asarray(faces, dtype=int)
     if coordinate_array.ndim != 2 or coordinate_array.shape[1] != 3:
-        raise ValueError("coordinates must be a two-dimensional array with x/y/z columns.")
+        raise ValueError("coordinates 必须是包含 x/y/z 三列的二维数组。")
     if face_array.ndim != 2 or face_array.shape[1] != 3:
-        raise ValueError("faces must be a two-dimensional array with three vertex indices.")
+        raise ValueError("faces 必须是包含三个顶点索引列的二维数组。")
     if face_array.size == 0:
-        raise ValueError("faces must contain at least one triangle.")
+        raise ValueError("faces 至少需要包含一个三角面。")
     if np.any(face_array < 0) or np.any(face_array >= coordinate_array.shape[0]):
-        raise ValueError("faces contain vertex indices outside the coordinate array.")
+        raise ValueError("faces 包含超出坐标数组范围的顶点索引。")
     if not np.all(np.isfinite(coordinate_array)):
-        raise ValueError("coordinates contains NaN or infinite values.")
+        raise ValueError("coordinates 包含 NaN 或无穷值。")
 
     r1 = coordinate_array[face_array[:, 0]]
     r2 = coordinate_array[face_array[:, 1]]
@@ -696,12 +696,12 @@ def compute_triangle_surface_geometry(
     area_vectors = 0.5 * np.cross(r2 - r1, r3 - r1)
     areas = np.linalg.norm(area_vectors, axis=1)
     if not np.all(np.isfinite(area_vectors)) or not np.all(np.isfinite(areas)):
-        raise ValueError("triangle area vectors contain NaN or infinite values.")
+        raise ValueError("三角面面积向量包含 NaN 或无穷值。")
     if np.any(areas <= 0.0):
-        raise ValueError("all triangle areas must be positive.")
+        raise ValueError("所有三角面面积都必须为正数。")
     normals = area_vectors / areas[:, np.newaxis]
     if not np.all(np.isfinite(normals)):
-        raise ValueError("triangle normals contain NaN or infinite values.")
+        raise ValueError("三角面法向量包含 NaN 或无穷值。")
     centers = (r1 + r2 + r3) / 3.0
     return SurfaceGeometry(
         coordinates=coordinate_array,
@@ -724,7 +724,7 @@ def _surface_path_from_connectivity_path(connectivity_path: str) -> str:
         map_index = parts.index("Face to Vertex Map")
     except ValueError as exc:
         raise ValueError(
-            f"ElementConnectivity path is not under a Face to Vertex Map: {connectivity_path}"
+            f"ElementConnectivity 路径不在 Face to Vertex Map 下：{connectivity_path}"
         ) from exc
     return "/" + "/".join(parts[:map_index])
 
@@ -764,7 +764,7 @@ def _read_surface_coordinates(root: Any, surface_path: str) -> np.ndarray:
         node_count = coordinate_vectors[0].size
         if all(vector.size == node_count for vector in coordinate_vectors):
             return np.column_stack(coordinate_vectors)
-    raise ValueError(f"Complete x/y/z coordinates were not found under {surface_path}.")
+    raise ValueError(f"在 {surface_path} 下找不到完整的 x/y/z 坐标。")
 
 
 def read_surface_geometry(
@@ -793,9 +793,9 @@ def read_surface_geometry(
         connectivity_match = _find_named_dataset(root, "ElementConnectivity")
         element_range_match = _find_named_dataset(root, "ElementRange")
         if connectivity_match is None:
-            raise ValueError("ElementConnectivity dataset was not found.")
+            raise ValueError("找不到 ElementConnectivity 数据集。")
         if element_range_match is None:
-            raise ValueError("ElementRange dataset was not found.")
+            raise ValueError("找不到 ElementRange 数据集。")
         connectivity_path, connectivity_dataset = connectivity_match
         element_range_path, element_range_dataset = element_range_match
         surface_path = _surface_path_from_connectivity_path(connectivity_path)
@@ -805,7 +805,7 @@ def read_surface_geometry(
         )
         if expected_face_count is not None and faces.shape[0] != int(expected_face_count):
             raise ValueError(
-                f"Parsed {faces.shape[0]} faces, but pressure has {expected_face_count} channels."
+                f"解析得到 {faces.shape[0]} 个面，但压力数据有 {expected_face_count} 个通道。"
             )
         coordinates = _read_surface_coordinates(root, surface_path)
 
@@ -892,7 +892,7 @@ def read_pressure_time_series(
     """
     paths = sort_time_step_paths(file_paths)
     if not paths:
-        raise ValueError("At least one CGNS file is required.")
+        raise ValueError("至少需要一个 CGNS 文件。")
 
     h5 = h5_module if h5_module is not None else _load_h5py()
     pressure_rows: list[np.ndarray] = []
@@ -920,13 +920,13 @@ def read_pressure_time_series(
             selected_dataset_path = dataset_path
         elif dataset_path != selected_dataset_path:
             raise ValueError(
-                "Pressure dataset path changed between files: "
-                f"{selected_dataset_path} vs {dataset_path}"
+                "不同文件中的压力数据集路径不一致："
+                f"{selected_dataset_path} 与 {dataset_path}"
             )
         if pressure_rows and vector.size != pressure_rows[0].size:
             raise ValueError(
-                f"Pressure node count changed in {path}: "
-                f"{vector.size} vs {pressure_rows[0].size}"
+                f"{path} 中的压力节点数发生变化："
+                f"{vector.size} 与 {pressure_rows[0].size}"
             )
         pressure_rows.append(vector)
         _report_progress(
@@ -1047,15 +1047,15 @@ def compute_pressure_complex_spectrum(
         ComplexPressureSpectrum 实例。
     """
     if dt <= 0.0:
-        raise ValueError("dt must be positive.")
+        raise ValueError("dt 必须为正数。")
 
     pressure_array = np.asarray(pressures, dtype=float)
     if pressure_array.ndim != 2:
-        raise ValueError("pressures must be a two-dimensional array: time steps x nodes.")
+        raise ValueError("pressures 必须是二维数组：时间步 x 节点。")
     if pressure_array.shape[0] < 2:
-        raise ValueError("At least two time steps are required for spectrum calculation.")
+        raise ValueError("计算频谱至少需要两个时间步。")
     if not np.all(np.isfinite(pressure_array)):
-        raise ValueError("pressures contains NaN or infinite values.")
+        raise ValueError("pressures 包含 NaN 或无穷值。")
 
     if remove_mean:
         spectrum_input = pressure_array - np.mean(pressure_array, axis=0, keepdims=True)
@@ -1159,18 +1159,18 @@ def compute_equivalent_force_spectrum(
     """
     area_vector_array = np.asarray(area_vectors, dtype=float)
     if area_vector_array.ndim != 2 or area_vector_array.shape[1] != 3:
-        raise ValueError("area_vectors must be a two-dimensional array with x/y/z columns.")
+        raise ValueError("area_vectors 必须是包含 x/y/z 三列的二维数组。")
 
     pressure_complex = spectrum.pressure_real + 1j * spectrum.pressure_imag
     if pressure_complex.ndim != 2:
-        raise ValueError("pressure spectrum arrays must be two-dimensional.")
+        raise ValueError("压力谱数组必须是二维数组。")
     if pressure_complex.shape[1] != area_vector_array.shape[0]:
         raise ValueError(
-            f"pressure spectrum has {pressure_complex.shape[1]} faces, "
-            f"but area_vectors has {area_vector_array.shape[0]} rows."
+            f"压力谱包含 {pressure_complex.shape[1]} 个面，"
+            f"但 area_vectors 有 {area_vector_array.shape[0]} 行。"
         )
     if spectrum.amplitude_scale.shape[0] != pressure_complex.shape[0]:
-        raise ValueError("amplitude_scale length must match the frequency count.")
+        raise ValueError("amplitude_scale 的长度必须与频率数量匹配。")
 
     # 复数力 = 压力(复数) × 面积矢量（矩阵乘）
     force_complex = pressure_complex @ area_vector_array
@@ -1289,16 +1289,16 @@ def compute_streaming_equivalent_force_summary(
     """
     paths = sort_time_step_paths(file_paths)
     if not paths:
-        raise ValueError("At least one CGNS file is required.")
+        raise ValueError("至少需要一个 CGNS 文件。")
     if pressure_block_size <= 0:
-        raise ValueError("pressure_block_size must be positive.")
+        raise ValueError("pressure_block_size 必须为正数。")
 
     area_vectors = np.asarray(geometry.area_vectors, dtype=float)
     if area_vectors.ndim != 2 or area_vectors.shape[1] != 3:
-        raise ValueError("geometry.area_vectors must have x/y/z columns.")
+        raise ValueError("geometry.area_vectors 必须包含 x/y/z 三列。")
     face_count = int(area_vectors.shape[0])
     if face_count == 0:
-        raise ValueError("geometry must contain at least one face.")
+        raise ValueError("geometry 至少需要包含一个面。")
 
     h5 = h5_module if h5_module is not None else _load_h5py()
     force_time = np.empty((len(paths), 3), dtype=float)
@@ -1315,12 +1315,12 @@ def compute_streaming_equivalent_force_summary(
             selected_dataset_path = dataset_path
         elif dataset_path != selected_dataset_path:
             raise ValueError(
-                "Pressure dataset path changed between files: "
-                f"{selected_dataset_path} vs {dataset_path}"
+                "不同文件中的压力数据集路径不一致："
+                f"{selected_dataset_path} 与 {dataset_path}"
             )
         if vector.size != face_count:
             raise ValueError(
-                f"Pressure channel count changed in {path}: {vector.size} vs {face_count}."
+                f"{path} 中的压力通道数发生变化：{vector.size} 与 {face_count}。"
             )
         force_time[index, :] = vector @ area_vectors  # 矩阵向量乘
         coherent_pressure_time[index] = float(np.sum(vector))
@@ -1356,13 +1356,13 @@ def compute_streaming_equivalent_force_summary(
                 selected_dataset_path = dataset_path
             elif dataset_path != selected_dataset_path:
                 raise ValueError(
-                    "Pressure dataset path changed between files: "
-                    f"{selected_dataset_path} vs {dataset_path}"
+                    "不同文件中的压力数据集路径不一致："
+                    f"{selected_dataset_path} 与 {dataset_path}"
                 )
             if channel_count != face_count:
                 raise ValueError(
-                    f"Pressure channel count changed in {path}: "
-                    f"{channel_count} vs {face_count}."
+                    f"{path} 中的压力通道数发生变化："
+                    f"{channel_count} 与 {face_count}。"
                 )
             pressure_block[time_index, :] = vector
 
@@ -1373,7 +1373,7 @@ def compute_streaming_equivalent_force_summary(
             remove_mean=False,
         )
         if not np.allclose(block_spectrum.frequencies_hz, frequencies):
-            raise RuntimeError("Pressure block frequency grid changed unexpectedly.")
+            raise RuntimeError("压力分块的频率网格意外变化。")
         # 滚动更新最大值和平方和
         max_pressure_amplitude = np.maximum(
             max_pressure_amplitude,
@@ -1414,11 +1414,11 @@ def compute_pulsating_pressure(pressures: np.ndarray) -> np.ndarray:
     """
     pressure_array = np.asarray(pressures, dtype=float)
     if pressure_array.ndim != 2:
-        raise ValueError("pressures must be a two-dimensional array: time steps x nodes.")
+        raise ValueError("pressures 必须是二维数组：时间步 x 节点。")
     if pressure_array.shape[0] == 0 or pressure_array.shape[1] == 0:
-        raise ValueError("pressures must contain at least one time step and one node.")
+        raise ValueError("pressures 至少需要包含一个时间步和一个节点。")
     if not np.all(np.isfinite(pressure_array)):
-        raise ValueError("pressures contains NaN or infinite values.")
+        raise ValueError("pressures 包含 NaN 或无穷值。")
     return pressure_array - np.mean(pressure_array, axis=0, keepdims=True)
 
 
@@ -1450,7 +1450,7 @@ def _payload_common_parts(
 ) -> tuple[np.ndarray, np.ndarray, MetadataPayload, list[int], dict[str, list[float]] | None]:
     """提取 JSON 有效载荷的公共组件：脉动压力、时间轴、元数据、节点ID、坐标。"""
     if dt <= 0.0:
-        raise ValueError("dt must be positive.")
+        raise ValueError("dt 必须为正数。")
 
     pulsating_pressure = compute_pulsating_pressure(series.pressures)
     times = np.arange(pulsating_pressure.shape[0], dtype=float) * float(dt)
@@ -1482,11 +1482,11 @@ def _coordinates_payload(series: PressureTimeSeries) -> dict[str, list[float]] |
         return None
     coordinates = np.asarray(series.coordinates, dtype=float)
     if coordinates.ndim != 2 or coordinates.shape[1] != 3:
-        raise ValueError("coordinates must be a two-dimensional array with x/y/z columns.")
+        raise ValueError("coordinates 必须是包含 x/y/z 三列的二维数组。")
     if coordinates.shape[0] != series.node_ids.size:
         raise ValueError(
-            f"coordinates has {coordinates.shape[0]} rows, "
-            f"but node_ids has {series.node_ids.size} values."
+            f"coordinates 有 {coordinates.shape[0]} 行，"
+            f"但 node_ids 有 {series.node_ids.size} 个值。"
         )
     return {
         "x": _as_float_list(coordinates[:, 0]),
@@ -1708,20 +1708,20 @@ def validate_cached_surface_geometry(geometry: SurfaceGeometry) -> None:
     normals = np.asarray(geometry.normals, dtype=float)
 
     if coordinates.ndim != 2 or coordinates.shape[1] != 3:
-        raise ValueError("Cached geometry coordinates must have x/y/z columns.")
+        raise ValueError("缓存几何的 coordinates 必须包含 x/y/z 三列。")
     if faces.ndim != 2 or faces.shape[1] != 3:
-        raise ValueError("Cached geometry faces must have three vertex indices.")
+        raise ValueError("缓存几何的 faces 必须包含三个顶点索引列。")
     face_count = faces.shape[0]
     if face_count == 0:
-        raise ValueError("Cached geometry must contain at least one face.")
+        raise ValueError("缓存几何至少需要包含一个面。")
     if centers.shape != (face_count, 3):
-        raise ValueError("Cached geometry centers shape does not match faces.")
+        raise ValueError("缓存几何的 centers 形状与 faces 不匹配。")
     if area_vectors.shape != (face_count, 3):
-        raise ValueError("Cached geometry area_vectors shape does not match faces.")
+        raise ValueError("缓存几何的 area_vectors 形状与 faces 不匹配。")
     if areas.shape != (face_count,):
-        raise ValueError("Cached geometry areas shape does not match faces.")
+        raise ValueError("缓存几何的 areas 形状与 faces 不匹配。")
     if normals.shape != (face_count, 3):
-        raise ValueError("Cached geometry normals shape does not match faces.")
+        raise ValueError("缓存几何的 normals 形状与 faces 不匹配。")
     if not (
         np.all(np.isfinite(coordinates))
         and np.all(np.isfinite(centers))
@@ -1729,11 +1729,11 @@ def validate_cached_surface_geometry(geometry: SurfaceGeometry) -> None:
         and np.all(np.isfinite(areas))
         and np.all(np.isfinite(normals))
     ):
-        raise ValueError("Cached geometry contains NaN or infinite values.")
+        raise ValueError("缓存几何包含 NaN 或无穷值。")
     if np.any(faces < 0) or np.any(faces >= coordinates.shape[0]):
-        raise ValueError("Cached geometry faces contain indices outside the coordinate array.")
+        raise ValueError("缓存几何的 faces 包含超出坐标数组范围的索引。")
     if np.any(areas <= 0.0):
-        raise ValueError("Cached geometry areas must be positive.")
+        raise ValueError("缓存几何的面积必须为正数。")
 
 
 def load_surface_geometry_npz(
@@ -1769,8 +1769,8 @@ def load_surface_geometry_npz(
         expected_face_count
     ):
         raise ValueError(
-            f"Cached geometry has {geometry.faces.shape[0]} faces, "
-            f"but pressure has {expected_face_count} channels."
+            f"缓存几何有 {geometry.faces.shape[0]} 个面，"
+            f"但压力数据有 {expected_face_count} 个通道。"
         )
     return geometry
 
@@ -1826,9 +1826,9 @@ def write_equivalent_force_spectrum_csv(
 def build_sampling_quality_metadata(sample_count: int, dt: float) -> dict[str, float | int]:
     """生成用于判断 FFT 分辨率和有效频率范围的采样元数据。"""
     if sample_count <= 0:
-        raise ValueError("sample_count must be positive.")
+        raise ValueError("sample_count 必须为正数。")
     if dt <= 0.0:
-        raise ValueError("dt must be positive.")
+        raise ValueError("dt 必须为正数。")
 
     record_duration = float(sample_count) * float(dt)
     return {
@@ -1974,7 +1974,7 @@ def write_enhanced_outputs(
 
     if export_equivalent_force:
         if geometry is None or spectrum is None:
-            raise RuntimeError("surface geometry and complex pressure spectrum are required.")
+            raise RuntimeError("需要同时提供表面几何和复数压力谱。")
         force_spectrum = compute_equivalent_force_spectrum(spectrum, geometry.area_vectors)
         force_path = output_path / "equivalent_force_spectrum.csv"
         write_equivalent_force_spectrum_csv(force_path, force_spectrum)
@@ -2026,9 +2026,9 @@ def write_streaming_summary_outputs(
     """
     paths = sort_time_step_paths(file_paths)
     if not paths:
-        raise ValueError("At least one CGNS file is required.")
+        raise ValueError("至少需要一个 CGNS 文件。")
     if pressure_block_size <= 0:
-        raise ValueError("pressure_block_size must be positive.")
+        raise ValueError("pressure_block_size 必须为正数。")
 
     h5 = h5_module if h5_module is not None else _load_h5py()
     first_dataset_path, first_vector = _read_pressure_vector_from_file(
@@ -2139,55 +2139,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """构建 CLI 参数解析器。"""
     parser = argparse.ArgumentParser(
         description=(
-            "Extract all-node pulsating pressure data from STAR-CCM+ "
-            "HDF5-CGNS time-step files."
+            "从 STAR-CCM+ HDF5-CGNS 时间步文件中提取全节点脉动压力数据。"
         )
     )
     parser.add_argument(
         "inputs", nargs="+",
-        help="CGNS file path or glob pattern, for example other_files/data/604@*.cgns",
+        help="CGNS 文件路径或 glob 匹配模式，例如 other_files/data/604@*.cgns",
     )
     parser.add_argument(
         "--dt", type=float, required=True,
-        help="Physical time interval between adjacent CGNS files, in seconds.",
+        help="相邻 CGNS 文件之间的物理时间间隔，单位秒。",
     )
     parser.add_argument(
         "--output-dir", default="cgns_pressure_output",
-        help="Directory for pressure_time.json.gz, pressure_spectrum.json.gz, and pressure_average.json.gz.",
+        help="pressure_time.json.gz、pressure_spectrum.json.gz 和 pressure_average.json.gz 的输出目录。",
     )
-    parser.add_argument("--pressure-name", help="Pressure dataset basename or full CGNS/HDF5 path.")
-    parser.add_argument("--include-dc", action="store_true", help="Keep the 0 Hz component.")
+    parser.add_argument("--pressure-name", help="压力数据集名称或完整 CGNS/HDF5 路径。")
+    parser.add_argument("--include-dc", action="store_true", help="保留 0 Hz 分量。")
     parser.add_argument(
         "--export-complex-spectrum", action="store_true",
-        help="Write pressure_complex_spectrum.npz with raw complex FFT pressure data.",
+        help="写出包含原始复数 FFT 压力数据的 pressure_complex_spectrum.npz。",
     )
     parser.add_argument(
         "--export-surface-geometry", action="store_true",
-        help="Write surface_geometry.npz with triangle faces, centers, areas, and normals.",
+        help="写出包含三角面、面心、面积和法向量的 surface_geometry.npz。",
     )
     parser.add_argument(
         "--export-equivalent-force", action="store_true",
-        help="Write equivalent_force_spectrum.csv from coherent face pressure integration.",
+        help="由相干面压力积分写出 equivalent_force_spectrum.csv。",
     )
     parser.add_argument(
         "--export-analysis-summary", action="store_true",
-        help="Write summary analysis outputs only: surface_geometry.npz, equivalent_force_spectrum.csv, and extraction_metadata.json.",
+        help="只写出汇总分析结果：surface_geometry.npz、equivalent_force_spectrum.csv 和 extraction_metadata.json。",
     )
     parser.add_argument(
         "--export-all-data", action="store_true",
-        help="Write summary analysis outputs plus the full pressure_complex_spectrum.npz.",
+        help="写出汇总分析结果，并额外写出完整 pressure_complex_spectrum.npz。",
     )
     parser.add_argument(
         "--skip-legacy-json", action="store_true",
-        help="Skip legacy JSON outputs, implies summary outputs.",
+        help="跳过旧版 JSON 输出，并自动启用汇总输出。",
     )
     parser.add_argument(
         "--surface-geometry-cache",
-        help="Load an existing surface_geometry.npz instead of re-reading CGNS geometry.",
+        help="加载已有 surface_geometry.npz，而不是重新读取 CGNS 几何。",
     )
     parser.add_argument(
         "--pressure-block-size", type=int, default=16384,
-        help="Number of pressure faces per FFT block for streaming summary outputs.",
+        help="流式汇总输出中每个 FFT 分块包含的压力面数量。",
     )
     return parser.parse_args(argv)
 
@@ -2266,20 +2265,20 @@ def run_cli(argv: list[str] | None = None) -> int:
                 **enhanced_options,
             )
     except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"错误：{exc}", file=sys.stderr)
         return 1
 
     if series is not None:
-        print(f"Read {len(series.file_paths)} CGNS files.")
-        print(f"Pressure dataset: {series.dataset_path}")
-        print(f"Pressure channels: {series.node_ids.size}")
+        print(f"已读取 {len(series.file_paths)} 个 CGNS 文件。")
+        print(f"压力数据集：{series.dataset_path}")
+        print(f"压力通道数：{series.node_ids.size}")
     else:
-        print(f"Processed {len(paths)} CGNS files with streaming summary mode.")
+        print(f"已用流式汇总模式处理 {len(paths)} 个 CGNS 文件。")
     for path in (time_json, spectrum_json, average_json):
         if path is not None:
-            print(f"Wrote: {path}")
+            print(f"已写入：{path}")
     for path in enhanced_outputs.values():
-        print(f"Wrote: {path}")
+        print(f"已写入：{path}")
     return 0
 
 
@@ -2419,7 +2418,7 @@ def run_gui() -> int:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
     except Exception as exc:
-        print(f"Error: Tkinter is required for GUI mode: {exc}", file=sys.stderr)
+        print(f"错误：图形界面模式需要 Tkinter：{exc}", file=sys.stderr)
         return 1
 
     root = tk.Tk()

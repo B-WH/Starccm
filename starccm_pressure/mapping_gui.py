@@ -33,19 +33,19 @@ def validate_mapping_gui_inputs(inp_path: str, extracted_dir: str, target_set: s
 def format_gui_error(exc: Exception) -> str:
     """把常见映射异常转换为面向用户的中文消息。"""
     message = str(exc)
-    if "Required surface geometry file was not found:" in message:
+    if "找不到必需的表面几何文件：" in message:
         return f"找不到 surface_geometry.npz。请检查 CGNS 提取结果目录。\n\n原始信息：{message}"
-    if "Target elset" in message and "was not found" in message:
+    if "找不到目标 elset" in message:
         return f"找不到目标 elset。请检查目标集合名称和集合类型。\n\n原始信息：{message}"
-    if "Target nset" in message and "was not found" in message:
+    if "找不到目标 nset" in message:
         return f"找不到目标 nset。请检查目标集合名称和集合类型。\n\n原始信息：{message}"
-    if "axis_order must be a permutation of 0, 1, 2" in message:
+    if "axis_order 必须是 0、1、2 的排列" in message:
         return "轴顺序必须是 0,1,2 的排列，例如 0,1,2 或 2,0,1。"
-    if "Expected three comma-separated values" in message:
+    if "需要输入三个逗号分隔的值" in message:
         return "请输入三个逗号分隔的数值，例如 0,1,2 或 1,-1,1。"
     if "比例系数必须是数字" in message:
         return "比例系数必须是数字，例如 1.0。"
-    if "Output INP must not overwrite the original INP" in message:
+    if "输出 INP 不能覆盖原始 INP" in message:
         return "输出 INP 不能覆盖原始 INP。请重新选择输出文件名。"
     return message
 

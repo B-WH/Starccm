@@ -9,8 +9,8 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 if ($Clean) {
-    Write-Host "Clean requested. This script does not delete files automatically."
-    Write-Host "Manual cleanup targets, if present:"
+    Write-Host "已请求清理。此脚本不会自动删除文件。"
+    Write-Host "如需清理，请手动检查并处理以下位置："
     Write-Host "  build\"
     Write-Host "  dist\"
     Write-Host "  extract_cgns_pressure_cli.spec"
@@ -55,7 +55,7 @@ python -B -m PyInstaller `
     --collect-submodules h5py `
     map_cgns_pressure_to_inp.py
 
-Write-Host "Wrote dist\extract_cgns_pressure_cli.exe"
-Write-Host "Wrote dist\extract_cgns_pressure_gui.exe"
-Write-Host "Wrote dist\map_cgns_pressure_to_inp_cli.exe"
-Write-Host "Wrote dist\map_cgns_pressure_to_inp_gui.exe"
+Write-Host "已写入 dist\extract_cgns_pressure_cli.exe"
+Write-Host "已写入 dist\extract_cgns_pressure_gui.exe"
+Write-Host "已写入 dist\map_cgns_pressure_to_inp_cli.exe"
+Write-Host "已写入 dist\map_cgns_pressure_to_inp_gui.exe"

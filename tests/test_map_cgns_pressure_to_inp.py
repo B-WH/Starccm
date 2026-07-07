@@ -1,8 +1,7 @@
 import ast
+import gzip
 import json
-import gc
 from pathlib import Path
-import time
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +10,7 @@ import numpy as np
 from map_cgns_pressure_to_inp import (
     FileSizeLimitError,
     _format_float,
+    _load_time_pressure,
     apply_global_conservation_correction,
     apply_coordinate_transform,
     _split_frequency_groups,
@@ -32,6 +32,7 @@ from map_cgns_pressure_to_inp import (
     transform_area_vectors,
     write_frequency_load_include,
     write_frequency_table_load_include,
+    write_time_load_include,
 )
 
 
@@ -43,13 +44,10 @@ def _test_path(name: str) -> Path:
 
 
 def _unlink_test_file(path: Path) -> None:
-    for _ in range(5):
-        try:
-            path.unlink(missing_ok=True)
-            return
-        except PermissionError:
-            gc.collect()
-            time.sleep(0.05)
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        pass
 
 
 def _read_real_cloads(path: Path) -> dict[int, np.ndarray]:
@@ -71,6 +69,12 @@ def _read_real_cloads(path: Path) -> dict[int, np.ndarray]:
     return forces
 
 
+def _write_time_pressure_json(path: Path, times: list[float], pressures: list[list[float]]) -> None:
+    payload = {"time_s": times, "pulsating_pressure": pressures}
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
 class MapCgnsPressureToInpTests(unittest.TestCase):
     def setUp(self) -> None:
         TEST_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -89,6 +93,8 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
             "map_test_model_mapped_g002_300Hz-400Hz.inp",
             "map_test_model_mapped_g002_300Hz-400Hz_loads.inc",
             "map_test_model_mapped_batch_loads.inc",
+            "map_test_bad_time_loads.inc",
+            "map_test_pressure_time.json.gz",
             "map_test_surface_geometry.npz",
             "map_test_pressure_complex_spectrum.npz",
             "map_test_near_zero_pressure_complex_spectrum.npz",
@@ -415,10 +421,10 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
 
         text = include_path.read_text(encoding="utf-8")
         self.assertIn("frequency_hz=100", text)
-        self.assertIn("** Real part", text)
+        self.assertIn("** 实部", text)
         self.assertIn("2, 1, 1", text)
         self.assertIn("2, 3, -2", text)
-        self.assertIn("** Imaginary part", text)
+        self.assertIn("** 虚部", text)
         self.assertIn("2, 1, 10", text)
         self.assertIn("2, 3, -20", text)
 
@@ -805,7 +811,7 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         self.assertTrue(any("频率块 1/2" in str(event["message"]) for event in events))
 
     def test_frequency_outside_tolerance_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "No extracted frequency"):
+        with self.assertRaisesRegex(ValueError, "没有提取频率"):
             find_frequency_index(np.array([95.0, 105.0]), 100.0, tolerance_hz=1.0)
 
     def test_frequency_range_expands_inclusive_hz_values(self) -> None:
@@ -857,7 +863,7 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
     def test_missing_target_set_is_rejected(self) -> None:
         model = parse_inp_text("*Node\n1,0,0,0\n*Step\n*Dynamic\n*End Step")
 
-        with self.assertRaisesRegex(ValueError, "Target elset 'SURF' was not found"):
+        with self.assertRaisesRegex(ValueError, "找不到目标 elset 'SURF'"):
             select_target_faces(model, "SURF", "elset")
 
     def test_time_load_record_limit_is_enforced(self) -> None:
@@ -867,6 +873,228 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
                 component_count=3,
                 sample_count=1000,
                 max_records=10000,
+            )
+
+    def test_load_time_pressure_rejects_mismatched_time_axis(self) -> None:
+        _write_time_pressure_json(
+            _test_path("map_test_pressure_time.json.gz"),
+            [0.0, 0.1],
+            [[1.0]],
+        )
+
+        with self.assertRaisesRegex(ValueError, "time_s 的长度必须"):
+            _load_time_pressure(
+                TEST_OUTPUT_DIR,
+                "map_test_pressure_time.json.gz",
+            )
+
+    def test_time_load_include_rejects_mismatched_time_axis(self) -> None:
+        node_series = {1: np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])}
+
+        with self.assertRaisesRegex(ValueError, "times 的长度必须"):
+            write_time_load_include(
+                _test_path("map_test_bad_time_loads.inc"),
+                node_series,
+                np.array([0.0]),
+            )
+
+    def test_resolve_worker_count_uses_auto_thread_count(self) -> None:
+        from starccm_pressure import map_cgns_pressure_to_inp as mapper
+
+        with patch("map_cgns_pressure_to_inp.os.cpu_count", return_value=8):
+            self.assertEqual(mapper._resolve_worker_count(0), 12)
+
+    def test_run_mapping_uses_thread_pool_for_parallel_frequency_batches(self) -> None:
+        from starccm_pressure import map_cgns_pressure_to_inp as mapper
+
+        inp_path = _test_path("map_test_model.inp")
+        output_path = _test_path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step, name=HARMONIC",
+                    "*Steady State Dynamics",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            _test_path("map_test_surface_geometry.npz"),
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        np.savez_compressed(
+            _test_path("map_test_pressure_complex_spectrum.npz"),
+            frequencies_hz=np.array([100.0, 200.0], dtype=float),
+            pressure_real=np.array([[8.0], [2.0]], dtype=float),
+            pressure_imag=np.array([[6.0], [1.0]], dtype=float),
+        )
+        used_workers: list[int] = []
+
+        class RecordingPool:
+            def __init__(self, max_workers: int):
+                used_workers.append(max_workers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def map(self, fn, values):
+                return [fn(value) for value in values]
+
+            def submit(self, fn, *args, **kwargs):
+                class ImmediateFuture:
+                    def result(self):
+                        return fn(*args, **kwargs)
+
+                return ImmediateFuture()
+
+        with patch.object(mapper, "ThreadPoolExecutor", RecordingPool):
+            run_mapping(
+                inp_path=inp_path,
+                extracted_dir=TEST_OUTPUT_DIR,
+                target_set="SURF",
+                target_set_type="elset",
+                frequencies=[100.0, 200.0],
+                output_path=output_path,
+                surface_geometry_name="map_test_surface_geometry.npz",
+                complex_spectrum_name="map_test_pressure_complex_spectrum.npz",
+                frequency_batch_size=1,
+                num_workers=2,
+                show_progress=False,
+            )
+
+        self.assertEqual(used_workers, [2])
+
+    def test_run_mapping_generates_dynamic_time_domain_include(self) -> None:
+        inp_path = _test_path("map_test_model.inp")
+        output_path = _test_path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Heading",
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step, name=TRANSIENT",
+                    "*Dynamic",
+                    "0.1, 0.1",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            _test_path("map_test_surface_geometry.npz"),
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        _write_time_pressure_json(
+            _test_path("map_test_pressure_time.json.gz"),
+            [0.0, 0.1],
+            [[4.0], [8.0]],
+        )
+
+        result = run_mapping(
+            inp_path=inp_path,
+            extracted_dir=TEST_OUTPUT_DIR,
+            target_set="SURF",
+            target_set_type="elset",
+            output_path=output_path,
+            surface_geometry_name="map_test_surface_geometry.npz",
+            pressure_time_name="map_test_pressure_time.json.gz",
+        )
+
+        self.assertEqual(result.output_inp_path, output_path)
+        mapped_text = output_path.read_text(encoding="utf-8")
+        self.assertIn("*INCLUDE, INPUT=map_test_model_mapped_loads.inc", mapped_text)
+        include_text = _test_path("map_test_model_mapped_loads.inc").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("*Amplitude, name=CGNS_N1_D3, time=TOTAL TIME", include_text)
+        self.assertIn("0, -1", include_text)
+        self.assertIn("0.1, -2", include_text)
+        self.assertIn("*CLOAD, amplitude=CGNS_N1_D3", include_text)
+        self.assertIn("1, 3, 1.", include_text)
+        report = json.loads(_test_path("mapping_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["step_kind"], "dynamic")
+        self.assertEqual(report["time_sample_count"], 2)
+
+    def test_run_mapping_time_domain_writes_include_from_force_array(self) -> None:
+        from starccm_pressure import map_cgns_pressure_to_inp as mapper
+
+        inp_path = _test_path("map_test_model.inp")
+        output_path = _test_path("map_test_model_mapped.inp")
+        inp_path.write_text(
+            "\n".join(
+                [
+                    "*Node",
+                    "1, 0, 0, 0",
+                    "2, 1, 0, 0",
+                    "3, 1, 1, 0",
+                    "4, 0, 1, 0",
+                    "*Element, type=S4, elset=SURF",
+                    "10, 1, 2, 3, 4",
+                    "*Step",
+                    "*Dynamic",
+                    "*End Step",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        np.savez_compressed(
+            _test_path("map_test_surface_geometry.npz"),
+            centers=np.array([[0.5, 0.5, 0.0]], dtype=float),
+            area_vectors=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        )
+        _write_time_pressure_json(
+            _test_path("map_test_pressure_time.json.gz"),
+            [0.0, 0.1],
+            [[4.0], [8.0]],
+        )
+
+        original_write = mapper.write_time_load_include_from_force_array
+
+        def fake_write(path, node_ids, node_force_array, times, **kwargs):
+            self.assertIsInstance(node_ids, np.ndarray)
+            self.assertIsInstance(node_force_array, np.ndarray)
+            return original_write(
+                path,
+                node_ids,
+                node_force_array,
+                times,
+                **kwargs,
+            )
+
+        with patch.object(mapper, "write_time_load_include", side_effect=AssertionError(
+            "time-domain path should not build full node time series"
+        )), patch.object(
+            mapper,
+            "write_time_load_include_from_force_array",
+            side_effect=fake_write,
+        ):
+            run_mapping(
+                inp_path=inp_path,
+                extracted_dir=TEST_OUTPUT_DIR,
+                target_set="SURF",
+                target_set_type="elset",
+                output_path=output_path,
+                surface_geometry_name="map_test_surface_geometry.npz",
+                pressure_time_name="map_test_pressure_time.json.gz",
             )
 
     def test_coordinate_transform_supports_scale_translation_and_axis_order(self) -> None:
@@ -888,7 +1116,7 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         self.assertEqual(parse_gui_axis_order("2,0,1"), (2, 0, 1))
         self.assertEqual(parse_gui_axis_sign("1,-1,1"), (1.0, -1.0, 1.0))
 
-        with self.assertRaisesRegex(ValueError, "Expected three comma-separated values"):
+        with self.assertRaisesRegex(ValueError, "需要输入三个逗号分隔"):
             parse_gui_translate("1,2")
 
     def test_build_alignment_preview_applies_transform_and_reports_distances(self) -> None:
@@ -1041,17 +1269,17 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
             "找不到 surface_geometry.npz",
             format_gui_error(
                 FileNotFoundError(
-                    "Required surface geometry file was not found: cgns_pressure_output\\surface_geometry.npz"
+                    "找不到必需的表面几何文件：cgns_pressure_output\\surface_geometry.npz"
                 )
             ),
         )
         self.assertIn(
             "找不到目标 elset",
-            format_gui_error(ValueError("Target elset 'SURF' was not found.")),
+            format_gui_error(ValueError("找不到目标 elset 'SURF'。")),
         )
         self.assertIn(
             "轴顺序必须是 0,1,2 的排列",
-            format_gui_error(ValueError("axis_order must be a permutation of 0, 1, 2.")),
+            format_gui_error(ValueError("axis_order 必须是 0、1、2 的排列。")),
         )
 
     def test_mapping_gui_wires_progressbar_to_mapping_callback(self) -> None:
@@ -1192,7 +1420,7 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         )
 
         text = _test_path("map_test_model_mapped_loads.inc").read_text(encoding="utf-8")
-        self.assertIn("No nonzero steady-state loads", text)
+        self.assertIn("未生成非零稳态载荷", text)
         self.assertEqual(stats["global_max_abs_force"], 0.0)
         self.assertEqual(stats["active_cload_count"], 0)
 

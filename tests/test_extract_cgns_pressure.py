@@ -1,6 +1,4 @@
-import gc
 from pathlib import Path
-import time
 import unittest
 from unittest.mock import patch
 
@@ -24,13 +22,10 @@ TEST_OUTPUT_DIR = Path("work/test-output")
 
 def _unlink_test_file(path: Path) -> None:
     """Best-effort cleanup for one explicit test artifact on Windows."""
-    for _ in range(5):
-        try:
-            path.unlink(missing_ok=True)
-            return
-        except PermissionError:
-            gc.collect()
-            time.sleep(0.05)
+    try:
+        path.unlink(missing_ok=True)
+    except PermissionError:
+        pass
 
 
 class ExtractCgnsPressureTests(unittest.TestCase):
@@ -134,7 +129,7 @@ class ExtractCgnsPressureTests(unittest.TestCase):
                 coordinates=np.zeros((3, 3), dtype=float),
             )
 
-            with self.assertRaisesRegex(ValueError, "outside the coordinate array"):
+            with self.assertRaisesRegex(ValueError, "超出坐标数组范围"):
                 load_surface_geometry_npz(cache_path, expected_face_count=1)
         finally:
             if cache_path.exists():

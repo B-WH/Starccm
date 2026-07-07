@@ -48,7 +48,7 @@ class ProjectConfigurationTests(unittest.TestCase):
 
         self.assertNotIn("Remove-Item", build_script)
         self.assertNotIn("Get-ChildItem", build_script)
-        self.assertIn("does not delete files automatically", build_script)
+        self.assertIn("不会自动删除文件", build_script)
 
     def test_optional_dependency_loader_module_exists(self) -> None:
         from starccm_pressure.optional_deps import load_ckdtree
