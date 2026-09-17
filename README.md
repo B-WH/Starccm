@@ -230,28 +230,3 @@ python -B -m unittest tests.test_extract_cgns_pressure tests.test_map_cgns_press
 其中 `-B` 用于避免写入 `.pyc` 文件。在 Windows 环境中，`__pycache__` 文件有时会被锁定，使用 `-B` 可以减少这类缓存权限噪声。
 
 测试生成的临时文件集中写入 `work/test-output/`。
-
-## 仓库文件管理
-
-不要提交原始 CFD/FEA 数据或生成的分析结果。`.gitignore` 已排除常见的大文件和中间产物，包括：
-
-- `.cgns`
-- `.odb`
-- `.npz`
-- `.json.gz`
-- 生成的映射 INP 文件
-- 载荷 include 文件
-- Python 缓存目录
-- `work/test-output/`
-
-建议上传到 GitHub 的核心文件包括：
-
-- `extract_cgns_pressure.py`
-- `map_cgns_pressure_to_inp.py`
-- `starccm_pressure/`
-- `tests/`
-- `packaging/`
-- `.gitignore`
-- `README.md`
-- `requirements.txt`
-- `pyproject.toml`
