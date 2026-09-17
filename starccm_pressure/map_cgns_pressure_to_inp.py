@@ -28,6 +28,10 @@ from typing import Any, Callable, Iterable, Literal
 
 import numpy as np
 
+from starccm_pressure.extract_cgns_pressure import (
+    COMPLEX_SPECTRUM_SCHEMA_VERSION,
+    COMPLEX_VALUE_CONVENTION,
+)
 from starccm_pressure.inp_parser import (
     AbaqusElement,
     AbaqusModel,
@@ -1727,11 +1731,40 @@ def _load_complex_spectrum(
         raise FileNotFoundError(f"找不到必需的复数压力谱文件：{path}")
     with np.load(path) as saved:
         frequencies = np.asarray(saved["frequencies_hz"], dtype=float)
-        pressure = (
-            np.asarray(saved["pressure_real"], dtype=float)
-            + 1j * np.asarray(saved["pressure_imag"], dtype=float)
-        )
+        storage_mode = _complex_spectrum_storage_mode(saved)
+        if storage_mode == "legacy_polar":
+            pressure = np.asarray(saved["pressure_amplitude"], dtype=float) * np.exp(
+                1j * np.asarray(saved["pressure_phase_rad"], dtype=float)
+            )
+        else:
+            pressure = (
+                np.asarray(saved["pressure_real"], dtype=float)
+                + 1j * np.asarray(saved["pressure_imag"], dtype=float)
+            )
     return frequencies, pressure
+
+
+def _complex_spectrum_storage_mode(saved: Any) -> Literal["complex", "legacy_polar"]:
+    """识别归一化复谱或旧版未归一化复谱存储。"""
+    has_version = "complex_spectrum_schema_version" in saved
+    has_convention = "complex_value_convention" in saved
+    if has_version or has_convention:
+        if not (has_version and has_convention):
+            raise ValueError("复数压力谱缺少完整的格式版本信息。")
+        version = int(np.asarray(saved["complex_spectrum_schema_version"]).item())
+        convention = str(np.asarray(saved["complex_value_convention"]).item())
+        if (
+            version != COMPLEX_SPECTRUM_SCHEMA_VERSION
+            or convention != COMPLEX_VALUE_CONVENTION
+        ):
+            raise ValueError(
+                "不支持的复数压力谱格式："
+                f"version={version}, convention={convention}。"
+            )
+        return "complex"
+    if "pressure_amplitude" in saved and "pressure_phase_rad" in saved:
+        return "legacy_polar"
+    return "complex"
 
 
 def _discard_bytes(reader: Any, byte_count: int) -> None:
@@ -1812,24 +1845,34 @@ class _ComplexSpectrumRowReader:
         if not path.exists():
             raise FileNotFoundError(f"找不到必需的复数压力谱文件：{path}")
         self.path = path
-        self.frequencies = self._load_frequencies(path)
+        self.frequencies, self._storage_mode = self._load_header(path)
         self._archive: zipfile.ZipFile | None = None
         self._real: _NpzArrayRowStream | None = None
         self._imag: _NpzArrayRowStream | None = None
         self.source_count = 0
 
     @staticmethod
-    def _load_frequencies(path: Path) -> np.ndarray:
-        """仅读取频率轴，避免提前载入完整压力矩阵。"""
+    def _load_header(
+        path: Path,
+    ) -> tuple[np.ndarray, Literal["complex", "legacy_polar"]]:
+        """读取频率轴和复数值存储约定，避免载入完整压力矩阵。"""
         with np.load(path) as saved:
-            return np.asarray(saved["frequencies_hz"], dtype=float)
+            return (
+                np.asarray(saved["frequencies_hz"], dtype=float),
+                _complex_spectrum_storage_mode(saved),
+            )
 
     def __enter__(self) -> "_ComplexSpectrumRowReader":
         """打开 npz 包和实部/虚部成员流。"""
         self._archive = zipfile.ZipFile(self.path)
         try:
-            self._real = _NpzArrayRowStream(self._archive, "pressure_real.npy")
-            self._imag = _NpzArrayRowStream(self._archive, "pressure_imag.npy")
+            first_member, second_member = (
+                ("pressure_amplitude.npy", "pressure_phase_rad.npy")
+                if self._storage_mode == "legacy_polar"
+                else ("pressure_real.npy", "pressure_imag.npy")
+            )
+            self._real = _NpzArrayRowStream(self._archive, first_member)
+            self._imag = _NpzArrayRowStream(self._archive, second_member)
             if self._real.shape != self._imag.shape:
                 raise ValueError("pressure_real 和 pressure_imag 的形状必须一致。")
             if self._real.shape[0] != self.frequencies.size:
@@ -1864,9 +1907,11 @@ class _ComplexSpectrumRowReader:
         """读取指定频率行并合成为复数压力矩阵。"""
         if self._real is None or self._imag is None:
             raise RuntimeError("复数压力谱读取器尚未打开。")
-        real = self._real.read_rows(row_indices)
-        imag = self._imag.read_rows(row_indices)
-        return real + 1j * imag
+        first = self._real.read_rows(row_indices)
+        second = self._imag.read_rows(row_indices)
+        if self._storage_mode == "legacy_polar":
+            return first * np.exp(1j * second)
+        return first + 1j * second
 
 
 def _is_non_decreasing(values: list[int]) -> bool:
@@ -2235,6 +2280,8 @@ def run_mapping(
         spectrum_reader = _ComplexSpectrumRowReader(extracted / complex_spectrum_name)
         spectrum_reader.__enter__()
         extracted_frequencies = spectrum_reader.frequencies
+        report["complex_value_convention"] = COMPLEX_VALUE_CONVENTION
+        report["legacy_spectrum_converted"] = spectrum_reader._storage_mode == "legacy_polar"
 
         if show_progress:
             print(f"  源面数量: {spectrum_reader.source_count}, "

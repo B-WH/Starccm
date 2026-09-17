@@ -81,7 +81,7 @@ python extract_cgns_pressure.py "other_files\data\604@*.cgns" `
 主要输出文件：
 
 - `surface_geometry.npz`：CGNS 表面面心、面积向量、法向和连通几何。
-- `pressure_complex_spectrum.npz`：全场复数压力谱，用于频域压力映射。
+- `pressure_complex_spectrum.npz`：全场单边峰值复压力谱，用于频域压力映射；实部和虚部已采用与幅值列一致的 FFT 归一化。
 - `pressure_time.json.gz`：时域脉动压力，仅在瞬态或显式动力学载荷映射时使用。
 - `equivalent_force_spectrum.csv`：相干积分得到的全局等效力谱。
 - `extraction_metadata.json`：提取过程和采样参数元数据。
@@ -165,6 +165,8 @@ python map_cgns_pressure_to_inp.py `
 受载区域必须指定为 Abaqus 中已有的 `Nset` 或 `Elset`。程序不会默认把压力映射到全部节点，避免把内部节点或非受压区域错误加载。
 
 映射程序在目标面的积分点上使用源面心反距离权重插值，并通过形函数积分生成一致等效节点力；随后用最小范数修正保证目标节点载荷与源 CGNS 压力载荷的全局总力和总力矩一致。安装可选加速依赖 `scipy` 后会自动使用 `scipy.spatial.cKDTree` 加速最近邻查询；没有 `scipy` 时会回退到 NumPy 全量距离扫描。
+
+当前提取器写出的复数谱采用单边峰值复幅值约定。映射器也兼容旧版完整 NPZ：若文件没有格式版本但包含 `pressure_amplitude` 和 `pressure_phase_rad`，会用二者重建已归一化复数压力，避免把原始 FFT 系数直接作为 Abaqus 载荷。
 
 `mapping_report.json` 会记录本次映射的主要物理假设：
 

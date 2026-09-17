@@ -9,6 +9,7 @@ import numpy as np
 
 from map_cgns_pressure_to_inp import (
     FileSizeLimitError,
+    _ComplexSpectrumRowReader,
     _format_float,
     _load_time_pressure,
     apply_global_conservation_correction,
@@ -97,6 +98,7 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
             "map_test_pressure_time.json.gz",
             "map_test_surface_geometry.npz",
             "map_test_pressure_complex_spectrum.npz",
+            "map_test_legacy_pressure_complex_spectrum.npz",
             "map_test_near_zero_pressure_complex_spectrum.npz",
             "map_test_near_zero_surface_geometry.npz",
             "mapping_report.json",
@@ -758,6 +760,27 @@ class MapCgnsPressureToInpTests(unittest.TestCase):
         self.assertIn("200, -2", include_text)
         self.assertIn("300, -0.5", include_text)
         self.assertNotIn("100,", include_text)
+
+    def test_legacy_spectrum_rows_are_reconstructed_from_amplitude_and_phase(self) -> None:
+        spectrum_path = _test_path("map_test_legacy_pressure_complex_spectrum.npz")
+        np.savez_compressed(
+            spectrum_path,
+            frequencies_hz=np.array([100.0], dtype=float),
+            pressure_real=np.array([[4.0]], dtype=float),
+            pressure_imag=np.array([[0.0]], dtype=float),
+            pressure_amplitude=np.array([[1.0]], dtype=float),
+            pressure_phase_rad=np.array([[0.25]], dtype=float),
+        )
+
+        with _ComplexSpectrumRowReader(spectrum_path) as reader:
+            pressure = reader.read_complex_rows(np.array([0], dtype=int))
+
+        np.testing.assert_allclose(
+            pressure[0, 0],
+            np.exp(0.25j),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
 
     def test_run_mapping_reports_progress_callback_for_steady_state_batches(self) -> None:
         inp_path = _test_path("map_test_model.inp")

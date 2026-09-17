@@ -34,8 +34,9 @@ import glob
 import gzip
 import json
 import re
-import threading
 import sys
+import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,8 @@ import numpy as np
 DEFAULT_PRESSURE_NAMES = ("Pressure", "pressure")  # 默认压力变量名候选
 SCHEMA_VERSION = 1                                  # JSON 输出格式版本
 SURFACE_GEOMETRY_CACHE_SCHEMA_VERSION = 2
+COMPLEX_SPECTRUM_SCHEMA_VERSION = 2
+COMPLEX_VALUE_CONVENTION = "single_sided_peak_amplitude"
 COORDINATE_NAMES = ("CoordinateX", "CoordinateY", "CoordinateZ")
 TRI_3_MIXED_ELEMENT_CODE = 5  # CGNS MIXED 元素中 TRI_3 的类型码
 
@@ -114,11 +117,11 @@ class ComplexPressureSpectrum:
 
     Attributes:
         frequencies_hz: 频率轴（Hz）。
-        pressure_real: 压力 FFT 实部 (N_freq, N_nodes)。
-        pressure_imag: 压力 FFT 虚部 (N_freq, N_nodes)。
+        pressure_real: 单边峰值复压力实部 (N_freq, N_nodes)。
+        pressure_imag: 单边峰值复压力虚部 (N_freq, N_nodes)。
         pressure_amplitude: 单边幅值谱（已乘缩放系数）。
         pressure_phase_rad: 相位谱（弧度）。
-        amplitude_scale: 各频率的幅值缩放系数。
+        amplitude_scale: 从原始 FFT 系数转换为单边峰值复幅值的缩放系数。
     """
     frequencies_hz: np.ndarray
     pressure_real: np.ndarray
@@ -1065,20 +1068,21 @@ def compute_pressure_complex_spectrum(
     fft_values = np.fft.rfft(spectrum_input, axis=0)
     frequencies = np.fft.rfftfreq(sample_count, d=dt)
     amplitude_scale = _single_sided_amplitude_scale(sample_count)
-    amplitudes = np.abs(fft_values) * amplitude_scale[:, np.newaxis]
-    phases_rad = np.angle(fft_values)
+    complex_amplitudes = fft_values * amplitude_scale[:, np.newaxis]
+    amplitudes = np.abs(complex_amplitudes)
+    phases_rad = np.angle(complex_amplitudes)
 
     if not include_dc:
         frequencies = frequencies[1:]
-        fft_values = fft_values[1:, :]
+        complex_amplitudes = complex_amplitudes[1:, :]
         amplitudes = amplitudes[1:, :]
         phases_rad = phases_rad[1:, :]
         amplitude_scale = amplitude_scale[1:]
 
     return ComplexPressureSpectrum(
         frequencies_hz=frequencies,
-        pressure_real=fft_values.real,
-        pressure_imag=fft_values.imag,
+        pressure_real=complex_amplitudes.real,
+        pressure_imag=complex_amplitudes.imag,
         pressure_amplitude=amplitudes,
         pressure_phase_rad=phases_rad,
         amplitude_scale=amplitude_scale,
@@ -1174,11 +1178,11 @@ def compute_equivalent_force_spectrum(
 
     # 复数力 = 压力(复数) × 面积矢量（矩阵乘）
     force_complex = pressure_complex @ area_vector_array
-    force_amplitude = np.abs(force_complex) * spectrum.amplitude_scale[:, np.newaxis]
+    force_amplitude = np.abs(force_complex)
     force_phase = np.angle(force_complex)
     force_magnitude = np.linalg.norm(force_amplitude, axis=1)
     # 相干压力求和：所有面元压力的直接复数求和（未加权面积）
-    coherent_pressure = np.abs(np.sum(pressure_complex, axis=1)) * spectrum.amplitude_scale
+    coherent_pressure = np.abs(np.sum(pressure_complex, axis=1))
     return {
         "frequencies_hz": spectrum.frequencies_hz,
         "force_real_x": force_complex[:, 0].real,
@@ -1263,13 +1267,12 @@ def compute_streaming_equivalent_force_summary(
 
     适用于大规模网格（数百万面元）场景。分两个阶段：
 
-    阶段 1 —— 力时间序列：
-    逐时间步读取全部面元压力，与面积矢量相乘累加为
-    (合力_x, 合力_y, 合力_z, 相干压力和)，得到 (N_time, 4) 矩阵。
-    对合力做 FFT 得到力谱。
+    阶段 1 —— 单次读取与磁盘转置缓存：
+    每个 CGNS 文件只读取一次；同时积分力时间序列，并把压力行写入
+    临时磁盘映射数组，避免完整压力矩阵占用内存。
 
     阶段 2 —— 压力分块统计：
-    将面元分为若干块，每块分别读取所有时间步的压力 →
+    将磁盘映射数组按面元分块读取，每块执行
     FFT → 记录最大幅值和平方和。最后合并为全场
     max_pressure_amplitude 和 rms_pressure_amplitude。
 
@@ -1303,93 +1306,99 @@ def compute_streaming_equivalent_force_summary(
     h5 = h5_module if h5_module is not None else _load_h5py()
     force_time = np.empty((len(paths), 3), dtype=float)
     coherent_pressure_time = np.empty(len(paths), dtype=float)
-    selected_dataset_path: str | None = None
 
-    # 阶段 1：逐时间步积分等效力
-    for index, path in enumerate(paths):
-        _check_cancelled(cancel_event)
-        dataset_path, vector = _read_pressure_vector_from_file(
-            h5, path, pressure_name, selected_dataset_path,
+    # 每个 CGNS 只读取一次；磁盘映射数组承担转置缓存，避免占满内存。
+    temporary_root = Path("work/tmp").resolve()
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix="starccm_pressure_",
+        suffix=".dat",
+        dir=temporary_root,
+        delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name).resolve()
+    if temporary_path.parent != temporary_root:
+        raise RuntimeError("临时压力文件不在预期的 work/tmp 目录中。")
+    try:
+        pressure_store = np.memmap(
+            temporary_path,
+            mode="w+",
+            dtype=float,
+            shape=(len(paths), face_count),
         )
-        if selected_dataset_path is None:
-            selected_dataset_path = dataset_path
-        elif dataset_path != selected_dataset_path:
-            raise ValueError(
-                "不同文件中的压力数据集路径不一致："
-                f"{selected_dataset_path} 与 {dataset_path}"
-            )
-        if vector.size != face_count:
-            raise ValueError(
-                f"{path} 中的压力通道数发生变化：{vector.size} 与 {face_count}。"
-            )
-        force_time[index, :] = vector @ area_vectors  # 矩阵向量乘
-        coherent_pressure_time[index] = float(np.sum(vector))
-        _report_progress(
-            progress_callback,
-            "stream_force",
-            index + 1,
-            len(paths),
-            f"已积分 {path.name}",
-        )
-
-    force_result = _force_spectrum_from_time_series(
-        force_time, coherent_pressure_time,
-        dt=dt, include_dc=include_dc,
-    )
-    frequencies = force_result["frequencies_hz"]
-
-    # 阶段 2：分块 FFT 统计全场压力谱
-    max_pressure_amplitude = np.full(frequencies.shape, -np.inf, dtype=float)
-    pressure_amplitude_square_sum = np.zeros(frequencies.shape, dtype=float)
-
-    block_total = (face_count + pressure_block_size - 1) // pressure_block_size
-    for block_index, start in enumerate(range(0, face_count, pressure_block_size), start=1):
-        _check_cancelled(cancel_event)
-        end = min(start + pressure_block_size, face_count)
-        pressure_block = np.empty((len(paths), end - start), dtype=float)
-        selected_dataset_path = None
-        for time_index, path in enumerate(paths):
-            dataset_path, vector, channel_count = _read_pressure_vector_slice_from_file(
-                h5, path, pressure_name, start, end, selected_dataset_path,
-            )
-            if selected_dataset_path is None:
-                selected_dataset_path = dataset_path
-            elif dataset_path != selected_dataset_path:
-                raise ValueError(
-                    "不同文件中的压力数据集路径不一致："
-                    f"{selected_dataset_path} 与 {dataset_path}"
+        try:
+            selected_dataset_path: str | None = None
+            for index, path in enumerate(paths):
+                _check_cancelled(cancel_event)
+                dataset_path, vector = _read_pressure_vector_from_file(
+                    h5, path, pressure_name, selected_dataset_path,
                 )
-            if channel_count != face_count:
-                raise ValueError(
-                    f"{path} 中的压力通道数发生变化："
-                    f"{channel_count} 与 {face_count}。"
+                if selected_dataset_path is None:
+                    selected_dataset_path = dataset_path
+                elif dataset_path != selected_dataset_path:
+                    raise ValueError(
+                        "不同文件中的压力数据集路径不一致："
+                        f"{selected_dataset_path} 与 {dataset_path}"
+                    )
+                if vector.size != face_count:
+                    raise ValueError(
+                        f"{path} 中的压力通道数发生变化：{vector.size} 与 {face_count}。"
+                    )
+                pressure_store[index, :] = vector
+                force_time[index, :] = vector @ area_vectors
+                coherent_pressure_time[index] = float(np.sum(vector))
+                _report_progress(
+                    progress_callback,
+                    "stream_force",
+                    index + 1,
+                    len(paths),
+                    f"已读取并积分 {path.name}",
                 )
-            pressure_block[time_index, :] = vector
 
-        block_spectrum = compute_pressure_complex_spectrum(
-            compute_pulsating_pressure(pressure_block),
-            dt=dt,
-            include_dc=include_dc,
-            remove_mean=False,
-        )
-        if not np.allclose(block_spectrum.frequencies_hz, frequencies):
-            raise RuntimeError("压力分块的频率网格意外变化。")
-        # 滚动更新最大值和平方和
-        max_pressure_amplitude = np.maximum(
-            max_pressure_amplitude,
-            np.max(block_spectrum.pressure_amplitude, axis=1),
-        )
-        pressure_amplitude_square_sum += np.sum(
-            block_spectrum.pressure_amplitude**2,
-            axis=1,
-        )
-        _report_progress(
-            progress_callback,
-            "pressure_blocks",
-            block_index,
-            block_total,
-            f"已计算压力频谱分块 {block_index}/{block_total}",
-        )
+            force_result = _force_spectrum_from_time_series(
+                force_time, coherent_pressure_time,
+                dt=dt, include_dc=include_dc,
+            )
+            frequencies = force_result["frequencies_hz"]
+            max_pressure_amplitude = np.full(frequencies.shape, -np.inf, dtype=float)
+            pressure_amplitude_square_sum = np.zeros(frequencies.shape, dtype=float)
+
+            block_total = (face_count + pressure_block_size - 1) // pressure_block_size
+            for block_index, start in enumerate(
+                range(0, face_count, pressure_block_size),
+                start=1,
+            ):
+                _check_cancelled(cancel_event)
+                end = min(start + pressure_block_size, face_count)
+                pressure_block = np.array(pressure_store[:, start:end], dtype=float, copy=True)
+                block_spectrum = compute_pressure_complex_spectrum(
+                    pressure_block,
+                    dt=dt,
+                    include_dc=include_dc,
+                    remove_mean=True,
+                )
+                if not np.allclose(block_spectrum.frequencies_hz, frequencies):
+                    raise RuntimeError("压力分块的频率网格意外变化。")
+                max_pressure_amplitude = np.maximum(
+                    max_pressure_amplitude,
+                    np.max(block_spectrum.pressure_amplitude, axis=1),
+                )
+                pressure_amplitude_square_sum += np.sum(
+                    block_spectrum.pressure_amplitude**2,
+                    axis=1,
+                )
+                _report_progress(
+                    progress_callback,
+                    "pressure_blocks",
+                    block_index,
+                    block_total,
+                    f"已计算压力频谱分块 {block_index}/{block_total}",
+                )
+        finally:
+            pressure_store.flush()
+            del pressure_store
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
     force_result["max_pressure_amplitude"] = max_pressure_amplitude
     force_result["rms_pressure_amplitude"] = np.sqrt(
@@ -1782,6 +1791,8 @@ def write_pressure_complex_spectrum_npz(
     """保存复数压力谱为压缩 NPZ。"""
     np.savez_compressed(
         path,
+        complex_spectrum_schema_version=np.asarray(COMPLEX_SPECTRUM_SCHEMA_VERSION),
+        complex_value_convention=np.asarray(COMPLEX_VALUE_CONVENTION),
         frequencies_hz=spectrum.frequencies_hz,
         pressure_real=spectrum.pressure_real,
         pressure_imag=spectrum.pressure_imag,
@@ -1854,6 +1865,7 @@ def build_extraction_metadata(
         "remove_mean": bool(remove_mean),
         "file_count": len(series.file_paths),
         "pressure_channel_count": int(series.pressures.shape[1]),
+        "complex_value_convention": COMPLEX_VALUE_CONVENTION,
         "source_files": [str(path) for path in series.file_paths],
     }
     metadata.update(build_sampling_quality_metadata(series.pressures.shape[0], dt))
@@ -1890,6 +1902,7 @@ def build_streaming_extraction_metadata(
         "remove_mean": bool(remove_mean),
         "file_count": len(paths),
         "pressure_channel_count": int(pressure_channel_count),
+        "complex_value_convention": COMPLEX_VALUE_CONVENTION,
         "source_files": [str(path) for path in paths],
         "node_count": int(geometry.coordinates.shape[0]),
         "face_count": int(geometry.faces.shape[0]),
@@ -2714,22 +2727,3 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-
-# === 注释说明 ===
-# 1. 模块级 docstring：说明提取流程、关键数据结构和函数索引。
-# 2. 数据类 docstring：PressureTimeSeries/SurfaceGeometry/ComplexPressureSpectrum
-#    均有完整的 Attributes 说明。
-# 3. TypedDict docstring：ProgressEvent/MetadataPayload/TimePayload 等 JSON
-#    载荷类型均有字段说明。
-# 4. 函数 docstring（Google 风格）：所有公开函数含 Args/Returns/Raises 说明，
-#    重点解释了：
-#    - HDF5 数据集查找的三级匹配策略（精确名/候选列表/报错提示）
-#    - 流式分块 FFT 的两阶段算法（力时间序列 + 分块统计）
-#    - 单边幅值谱的缩放系数公式（DC 1/N, 其他 2/N）
-#    - 等效力为压力(复数) × 面积矢量的矩阵乘
-# 5. 行内注释：对非直观算法步骤（HDF5 多维数组切片、CGNS MIXED 元素码解析、
-#    滚动最大/平方和统计、GUI 进度百分比分配等）做了说明。
-# 6. 块注释：按功能分为常量、异常、数据结构、HDF5 导航、坐标、几何、
-#    进度、读取、FFT、等效力、脉动压力、JSON 载荷、文件写入、元数据、
-#    增强输出、CLI/GUI 等逻辑段落。
-# 7. 特殊标记：pyinstaller 打包命令注释在模块 docstring 中。

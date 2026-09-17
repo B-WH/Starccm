@@ -26,6 +26,7 @@ env/
 *.csv
 cgns_pressure_output/
 work/test-output/
+work/tmp/
 
 # Generated mapped Abaqus files
 map_test_*.inp
